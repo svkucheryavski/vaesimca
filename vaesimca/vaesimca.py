@@ -833,7 +833,6 @@ class VAESIMCARes:
             colors = COLORS
         if len(colors) < len(self.classes):
             raise ValueError(f"Colors for each of the {len(self.classes)} must be provided.")
-        print(colors)
 
         params = {'q': self.qParams, 'h': self.hParams, 'f': self.fParams}
         distances = {'q': self.q, 'h': self.h, 'f': self.f}[distance]
