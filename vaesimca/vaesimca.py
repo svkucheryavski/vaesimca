@@ -562,7 +562,7 @@ class VAESIMCA(nn.Module):
                              img_size=img_size, latent_dim=int(ld), transform=transform)
 
                 try:
-                    m._train(data_path=train_path, nepochs=nepochs, beta=beta, lr=lr, batch_size=int(batch_size),
+                    m.fit(data_path=train_path, nepochs=nepochs, beta=beta, lr=lr, batch_size=int(batch_size),
                          scheduler_gamma=scheduler_gamma, scheduler_step_size=scheduler_step_size, verbose=False)
                 except Exception as error:
                     print("A critical problem occured when training the model with following parameters:")
