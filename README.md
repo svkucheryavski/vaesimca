@@ -15,7 +15,7 @@ It requires `numpy`, `scipy`, `torch`, `torchvision`, `pandas` and `matplotlib`,
 
 ## Getting started
 
-Use Jupyter notebook [demo.ipynb](./demo/demo.ipynb) in order to get started. To run the examples from this notebook you need to download zip file with simulated dataset (it is also used for illustration of the method in the paper). Here is [direct link](./demo/images_simulated.zip) to the archive with the dataset.
+Use Jupyter notebook [demo.ipynb](https://github.com/svkucheryavski/vaesimca/blob/main/demo/demo.ipynb) in order to get started. To run the examples from this notebook you need to download zip file with simulated dataset (it is also used for illustration of the method in the paper). Here is [direct link](https://github.com/svkucheryavski/vaesimca/raw/main/demo/images_simulated.zip) to the archive with the dataset.
 
 Simply download the dataset and unzip it to your working directory, where you have the notebook, and follow the guides.
 
