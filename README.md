@@ -1,5 +1,7 @@
 # VAESIMCA — one class classifier based on Variational Autoencoders and data driven SIMCA approach
 
+**The package is currently in developing stage and break changes may occur. Do not use it so far for real cases. The stable release will come soon**
+
 The package *vaesimca* implements a method for creating one-class classification (OCC) models (also known as *anomaly detectors* or *novelty detectors*) using [Variational Autoencoders](https://en.wikipedia.org/wiki/Variational_autoencoder) (VAE). The overall idea is based on another OCC method, [DD-SIMCA](http://dx.doi.org/10.1002/cem.3556), and hence can be considered as a adaptation of the DD-SIMCA approach using VAE for data decomposition. The theoretical background and practical examples for the *vaesimca* methods are described in a paper which is currently under review (the link comes here later). It is recommended to read it first and then come back and try the examples below.
 
 Although the method we proposed is versatile, the package implements VAESIMCA method for analysis of images. It can be installed from [PyPI](https://pypi.org) using `pip` or any other package manager compatible with PyPI, e.g.:
