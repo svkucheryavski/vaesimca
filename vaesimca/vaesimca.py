@@ -20,6 +20,9 @@ from scipy.stats.distributions import chi2
 # the training
 MAX_EPOCHS_UNTIL_BEST_LOSS = 30
 
+# default plot colors and markers
+MARKERS = ['o', 's', '^', 'd', '>', 'h', 'p', 'v']
+COLORS = ['tab:blue', 'tab:green', 'tab:orange', 'tab:red', 'tab:purple', 'tab:olive', 'tab:pink', 'tab:gray']
 
 def plotlabels(plt, x, y, labels):
     """
@@ -827,10 +830,10 @@ class VAESIMCARes:
         if distance not in ('q', 'h', 'f'):
             raise ValueError("Invalid distance type specified. Choose 'q', 'h', or 'f'.")
         if colors is None:
-            colors = matplotlib.colors.TABLEAU_COLORS
+            colors = COLORS
         if len(colors) < len(self.classes):
             raise ValueError(f"Colors for each of the {len(self.classes)} must be provided.")
-
+        print(colors)
 
         params = {'q': self.qParams, 'h': self.hParams, 'f': self.fParams}
         distances = {'q': self.q, 'h': self.h, 'f': self.f}[distance]
@@ -886,9 +889,9 @@ class VAESIMCARes:
         """
 
         if markers is None:
-            markers = ['o', 's', '^', 'd', '>', 'h', 'p', 'v']
+            markers = MARKERS
         if colors is None:
-            colors = matplotlib.colors.TABLEAU_COLORS
+            colors = COLORS
 
         if len(colors) < len(self.classes):
             raise ValueError(f"Colors for each of the {len(self.classes)} must be provided.")
