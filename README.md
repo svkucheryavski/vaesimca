@@ -19,3 +19,7 @@ Use Jupyter notebook [demo.ipynb](https://github.com/svkucheryavski/vaesimca/blo
 
 Simply download the dataset and unzip it to your working directory, where you have the notebook, and follow the guides.
 
+## Releases
+
+**0.3.7**
+* fixed a bug in saving state dictionary of the best model during training loop
