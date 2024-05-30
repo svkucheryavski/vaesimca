@@ -2,8 +2,9 @@ import os
 import sys
 import math
 import torch
+import copy
 import numpy as np
-import matplotlib
+import matplotlib.pyplot
 import numpy.matlib
 import torch.optim as optim
 import pandas as pd
@@ -285,7 +286,7 @@ class VAESIMCA(nn.Module):
                 # the best, best model and reset epochs counter
                 best_loss = val_loss
                 best_loss_epochs = 0
-                best_model = self.state_dict()
+                best_model = copy.deepcopy(self.state_dict())
             elif ((val_loss - best_loss) / best_loss > tol):
                 # if difference between current and best validation loss is too large, stop training
                 if verbose:
