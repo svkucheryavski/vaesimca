@@ -9,12 +9,12 @@ import numpy.matlib
 import torch.optim as optim
 import pandas as pd
 import functools
-
+from PIL import Image
 from torch import nn
 from torch.nn import functional as F
 from torchvision import datasets
 from torch.utils.data import Dataset, SubsetRandomSampler, DataLoader
-
+from torch_lr_finder import LRFinder
 from scipy.stats.distributions import chi2
 
 # how many epochs without improving best validation loss to run
@@ -24,6 +24,7 @@ MAX_EPOCHS_UNTIL_BEST_LOSS = 30
 # default plot colors and markers
 MARKERS = ['o', 's', '^', 'd', '>', 'h', 'p', 'v']
 COLORS = ['tab:blue', 'tab:green', 'tab:orange', 'tab:red', 'tab:purple', 'tab:olive', 'tab:pink', 'tab:gray']
+
 
 def plotlabels(plt, x, y, labels):
     """
@@ -80,6 +81,76 @@ def getdistparams(u: np.array) -> tuple[float, float]:
 
     return (u0, 2 * u02 / vu)
 
+class VAEInputTargetWrapper(torch.utils.data.Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __getitem__(self, index):
+        x, _ = self.dataset[index]  # discard label
+        return x, x  # input and target are the same for VAE
+
+    def __len__(self):
+        return len(self.dataset)
+
+class VAELoss:
+    """ Class to compute loss value for VAE """
+
+    def __init__(self, beta=1.0):
+        self.beta = beta
+
+    def __call__(self, model_output, target):
+        recon_x, mu, logvar = model_output
+        recon_loss = F.binary_cross_entropy(recon_x, target, reduction='sum')
+        kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return recon_loss + self.beta * kl_div
+
+class CSVImageDataset(Dataset):
+    """
+    Class to handle image dataset stored as CSV file (each row is an image)
+
+    It is assumed that class names are located in the first column of the data frame.
+
+    Parameters
+    ----------
+    csv_path : str
+        Full path to CSV file with data values.
+    transform : callable
+        A function/transform that preprocess the data.
+    """
+
+    def __init__(self, csv_path:str, img_size:list, transform=None):
+        self.data = pd.read_csv(csv_path, index_col=0)
+        self.transform = transform
+
+        self.classnames = sorted(self.data.iloc[:, 0].unique())
+        self.classes = self.classnames
+        self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classnames)}
+        self.labels = self.data.iloc[:, 0].map(self.class_to_idx).values
+        self.images = self.data.iloc[:, 1:].values.astype(np.float32)
+        self.samples = [(str(i), label) for i, label in enumerate(self.labels)]
+        self.img_size = img_size
+
+        # Required for compatibility with ImageFolder-like code
+        self.samples = [(str(i), label) for i, label in enumerate(self.labels)]
+        self.imgs = self.samples  # Alias .imgs to .samples
+        self.targets = self.labels.tolist()  # Optional but standard
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        if self.img_size[2] == 1:
+            image = self.images[idx].reshape(self.img_size[0], self.img_size[1]).astype(np.uint8)
+            image = Image.fromarray(image, mode='L')
+        else:
+            image = self.images[idx].reshape(self.img_size[1], self.img_size[0], self.img_size[2]).astype(np.uint8)
+            image = Image.fromarray(image)
+
+        if self.transform:
+            image = self.transform(image)
+
+        label = self.labels[idx]
+        return image, label
 
 
 class VAESIMCA(nn.Module):
@@ -109,7 +180,7 @@ class VAESIMCA(nn.Module):
     """
 
     def __init__(self, encoder_class:nn.Module, decoder_class:nn.Module, classname:str, img_size:tuple,
-                 latent_dim:int, transform: callable):
+                 latent_dim:int, transform: callable, device=None):
 
         super(VAESIMCA, self).__init__()
 
@@ -131,7 +202,10 @@ class VAESIMCA(nn.Module):
         self.classname = classname
 
         # set the device and initialize encoder/decoder
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = device
         self.encoder = encoder_class(img_size=img_size, latent_dim=latent_dim).to(self.device)
         self.decoder = decoder_class(img_size=img_size, latent_dim=latent_dim).to(self.device)
 
@@ -157,6 +231,11 @@ class VAESIMCA(nn.Module):
         eps = torch.randn_like(std)
         return mu + eps * std
 
+
+    def forward(self, x:torch.Tensor)->tuple:
+        """ Wrapper of _forward method to be used for LRFinder """
+        recon_x, mu, logvar, _ = self._forward(x)
+        return recon_x, mu, logvar
 
     def _forward(self, x:torch.Tensor)->tuple:
         """
@@ -338,6 +417,56 @@ class VAESIMCA(nn.Module):
         self.n = len(q)
 
 
+    def _get_dataset(self, data_path:str):
+        """ Returns Dataset object """
+        if os.path.isdir(data_path):
+            return datasets.ImageFolder(root=data_path, transform=self.transform)
+        else:
+            return CSVImageDataset(csv_path=data_path, img_size=self.img_size, transform=self.transform)
+
+
+
+    def findlr(self, data_path:str, batch_size:int=10, beta:float=1.0,
+               num_iter:int=100, start_lr:float=1e-7, end_lr:float=100, weight_decay:float=1e-2):
+        """
+        Applied FindLR method from "torch_lr_finder" package to find optimal learning rate.
+
+        Parameters
+        ----------
+        data_path : str
+            Path to the directory containing images for the training set.
+        batch_size : int, optional
+            Batch size for training.
+        beta: float, optional
+            Regularization parameter for total loss (loss = reconstruction loss + beta * KL divergence).
+        num_iter : int, optional
+            Maximum number of iterations.
+        start_lr : float, optional
+            Initial learning rate for the finder.
+        end_lr : float, optional
+            Final learning rate for the finder.
+        weight_decay : float, optional
+            Weight decay parameter for Adam optimizer.
+
+        Returns
+        -------
+        lrfinder:
+            Object of LRFinder class which can be used to make plots, etc.
+
+        """
+
+        data = VAEInputTargetWrapper(self._get_dataset(data_path))
+        train_loader = DataLoader(data, batch_size=batch_size)
+        criterion = VAELoss(beta = beta)
+
+        optimizer = optim.Adam(self.parameters(), lr=1e-7, weight_decay=weight_decay)
+        lr_finder = LRFinder(self, optimizer, criterion, device=self.device)
+        lr_finder.range_test(train_loader, end_lr=100, num_iter=num_iter)
+        lr_finder.reset()
+
+        return lr_finder
+
+
     def fit(self, data_path:str, nepochs:int=30, batch_size:int=10, lr:float=0.001,
                 val_ratio:float = 0.2, tol:float = 0.05, beta:float = 1.0,
                 scheduler_step_size:int = 10, scheduler_gamma:float = 0.5,
@@ -374,7 +503,7 @@ class VAESIMCA(nn.Module):
             If no images found under the specified class name in the given path.
         """
 
-        data_all = datasets.ImageFolder(root=data_path, transform=self.transform)
+        data_all = self._get_dataset(data_path)
 
         # get a subset of thr training set from the target class
         try:
@@ -416,7 +545,8 @@ class VAESIMCA(nn.Module):
         if alpha < 0.00001 or alpha > 0.999999:
             raise ValueError("Wrong value for parameter 'alpha' (must be between 0.00001 and 0.999999).")
 
-        data = datasets.ImageFolder(root=data_path, transform=self.transform)
+        data = self._get_dataset(data_path)
+
         labels = [os.path.splitext(os.path.basename(path))[0] for path, label in data.imgs]
         classes = data.classes
         class_labels = [classes[i] for i in data.targets]
