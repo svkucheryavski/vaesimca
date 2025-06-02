@@ -1,10 +1,11 @@
 [build-system]
-requires = ["hatchling", "numpy", "scipy", "matplotlib", "torch", "torchvision", "pandas"]
+requires = ["hatchling", "numpy", "scipy", "matplotlib", "torch", "torchvision", "pandas", "torch_lr_finder"]
 build-backend = "hatchling.build"
 
 [project]
+license = "MIT"
 name = "vaesimca"
-version = "0.3.7"
+version = "0.4.2"
 authors = [
   { name="Sergey Kucheryavskiy", email="svkucheryavski@gmail.com" },
 ]
@@ -20,3 +21,6 @@ classifiers = [
 [project.urls]
 "Homepage" = "https://github.com/svkucheryavski/vaesimca"
 "Bug Tracker" = "https://github.com/svkucheryavski/pcv/vaesimca"
+
+[tool.setuptools]
+license-files = []
