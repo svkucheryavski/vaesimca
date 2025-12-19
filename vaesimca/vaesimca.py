@@ -5,10 +5,13 @@ import torch
 import copy
 import numpy as np
 import matplotlib.pyplot
-import numpy.matlib
 import torch.optim as optim
 import pandas as pd
 import functools
+import matplotlib.patches as mpatches
+import numpy.typing as npt
+import gc
+
 from PIL import Image
 from torch import nn
 from torch.nn import functional as F
@@ -25,37 +28,42 @@ MAX_EPOCHS_UNTIL_BEST_LOSS = 30
 MARKERS = ['o', 's', '^', 'd', '>', 'h', 'p', 'v']
 COLORS = ['tab:blue', 'tab:green', 'tab:orange', 'tab:red', 'tab:purple', 'tab:olive', 'tab:pink', 'tab:gray']
 
+# a small number to add to sd to avoid division by zero
+EPSILON = 1e-12
 
-def plotlabels(plt, x, y, labels):
+
+def plotlabels(plt:matplotlib.pyplot, x:npt.NDArray[np.float64], y:npt.NDArray[np.float64], labels:list, dy:float = None )-> None:
     """
     Shows labels on top of data points with coordinates (x, y)
     """
+
+    if not dy:
+        dy = (y.max() - y.min()) * 0.02
+
     for i in range(0, len(x)):
-        plt.text(x[i], y[i], labels[i], color="gray", ha = "center", fontsize = "medium")
+        plt.text(x[i], y[i] + dy, labels[i], color="gray", ha = "center", fontsize = "medium")
 
 
-def getlimits(u0, Nu, alpha = 0.05):
+def getlimits(u0:float, Nu:float, alpha:float = 0.05) -> float:
     """
     Compute statistical limits for extreme objects and outliers based on chi-square distribution.
     """
     return chi2.ppf(1 - alpha, Nu) * u0 / Nu
 
 
-def getdistparams(u: np.array) -> tuple[float, float]:
+def getdistparams(u: npt.NDArray[np.float64]) -> tuple[float, float]:
     """
     Computes parameters of a scaled chi-square distribution that approximate the distribution of the distance values using the method of moments.
 
     Parameters
     ----------
-    u : np.array
-        A vector (1D array) of distances to compute the distribution parameters for.
+    u : A vector (1D array) of distances to compute the distribution parameters for.
 
     Returns
     -------
-    tuple
-        A tuple containing two estimated parameters:
-        - u0 (float): The mean of the input distances.
-        - Nu (float): The estimated number of degrees of freedom for chi-squared distribution.
+    A tuple containing two estimated parameters:
+    - u0 (float): The mean of the input distances.
+    - Nu (float): The estimated number of degrees of freedom for chi-squared distribution.
 
     Raises
     ------
@@ -76,10 +84,11 @@ def getdistparams(u: np.array) -> tuple[float, float]:
     vu = ((u - u0)**2).mean()
     u02 = u0 ** 2
 
-    if math.sqrt(vu/u02) < 1e-6:
+    if u02 < EPSILON or vu < EPSILON or math.sqrt(vu/u02) < EPSILON:
         return (u0, 1)
 
     return (u0, 2 * u02 / vu)
+
 
 class VAEInputTargetWrapper(torch.utils.data.Dataset):
     def __init__(self, dataset):
@@ -92,17 +101,48 @@ class VAEInputTargetWrapper(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.dataset)
 
-class VAELoss:
-    """ Class to compute loss value for VAE """
 
-    def __init__(self, beta=1.0):
+class VAELoss:
+    """
+    Unified VAE loss computation with proper configuration.
+
+    Parameters
+    ----------
+    beta : float
+        Weight for KL divergence term
+    batch_size : int
+        Batch size (used for normalized loss)
+    """
+
+    def __init__(self, beta:float =1.0, loss_norm:bool = True):
+        if beta < 0:
+            raise ValueError(f"Beta must be non-negative, got {beta}")
+
         self.beta = beta
+        self.loss_norm = loss_norm
 
     def __call__(self, model_output, target):
         recon_x, mu, logvar = model_output
+        batch_size = recon_x.shape[0]
+
+        if self.loss_norm:
+            # reconstruction loss per sample
+            recon_loss = F.binary_cross_entropy(recon_x, target, reduction='none')
+            recon_loss = recon_loss.view(batch_size, -1).sum(dim=1)
+
+            # KL divergence per sample
+            kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+
+            # final loss
+            return (recon_loss + self.beta * kl_div).mean()
+
+        # previous version
         recon_loss = F.binary_cross_entropy(recon_x, target, reduction='sum')
         kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         return recon_loss + self.beta * kl_div
+
+
+
 
 class CSVImageDataset(Dataset):
     """
@@ -119,18 +159,30 @@ class CSVImageDataset(Dataset):
     """
 
     def __init__(self, csv_path:str, img_size:list, transform=None):
-        self.data = pd.read_csv(csv_path, index_col=0)
-        self.transform = transform
 
+        # load data from CSV file
+        self.data = pd.read_csv(csv_path, index_col=0)
+
+        # check image size
+        npixels_expected = np.prod(img_size)
+        npixels_provided = self.data.iloc[:, 1:].values.shape[1]
+        if npixels_expected != npixels_provided:
+            raise ValueError(f"Image size mismatch: expected {npixels_expected} pixels, got {npixels_provided}")
+
+
+        # extract class related information and labels
         self.classnames = sorted(self.data.iloc[:, 0].unique())
         self.classes = self.classnames
         self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classnames)}
         self.labels = self.data.iloc[:, 0].map(self.class_to_idx).values
+
+        # extract images and related information
         self.images = self.data.iloc[:, 1:].values.astype(np.float32)
         self.samples = [(str(i), label) for i, label in enumerate(self.labels)]
         self.img_size = img_size
+        self.transform = transform
 
-        # Required for compatibility with ImageFolder-like code
+        # required for compatibility with ImageFolder-like code
         self.samples = [(str(i), label) for i, label in enumerate(self.labels)]
         self.imgs = self.samples  # Alias .imgs to .samples
         self.targets = self.labels.tolist()  # Optional but standard
@@ -139,11 +191,13 @@ class CSVImageDataset(Dataset):
         return len(self.data)
 
     def __getitem__(self, idx):
+
+
         if self.img_size[2] == 1:
             image = self.images[idx].reshape(self.img_size[0], self.img_size[1]).astype(np.uint8)
             image = Image.fromarray(image, mode='L')
         else:
-            image = self.images[idx].reshape(self.img_size[1], self.img_size[0], self.img_size[2]).astype(np.uint8)
+            image = self.images[idx].reshape(self.img_size[0], self.img_size[1], self.img_size[2]).astype(np.uint8)
             image = Image.fromarray(image)
 
         if self.transform:
@@ -183,7 +237,6 @@ class VAESIMCA(nn.Module):
                  latent_dim:int, transform: callable, device=None):
 
         super(VAESIMCA, self).__init__()
-
         # initialization checks
         if len(img_size) != 3:
             raise ValueError("Parameter 'img_size' should include three values (width, height, num_channels).")
@@ -227,6 +280,9 @@ class VAESIMCA(nn.Module):
         torch.Tensor
             The sampled latent vector.
         """
+
+        if not self.training:
+            return mu
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
@@ -276,21 +332,23 @@ class VAESIMCA(nn.Module):
         Z = np.zeros((len(data), self.latent_dim))
         E = np.zeros((len(data), self.npixels * self.img_size[2]))
 
-        for i, image in enumerate(data_loader):
-            img = image[0]
-            pred, _, _, z = self._forward(img.to(self.device))
-            pred = pred.cpu().detach().numpy().squeeze()
-            img = img.cpu().detach().numpy()
-            z = z.cpu().detach().numpy().squeeze()
-            Z[i, :] = z
-            E[i, :] = (img - pred).reshape(1, self.npixels * self.img_size[2])
+        self.eval()
+        with torch.no_grad():
+            for i, image in enumerate(data_loader):
+                img = image[0].to(self.device)
+                pred, _, _, z = self._forward(img.to(self.device))
+                pred = pred.cpu().detach().numpy().squeeze()
+                img = img.cpu().detach().numpy()
+                z = z.cpu().detach().numpy().squeeze()
+                Z[i, :] = z
+                E[i, :] = (img - pred).reshape(1, self.npixels * self.img_size[2])
 
         return Z, E
 
 
     def _train_vae(self, data:Dataset, batch_size:int=10, nepochs:int=30, lr:float=0.001,
                    val_ratio:float = 0.2, tol:float = 0.05, beta:float = 1.0,
-                   scheduler_step_size = 10, scheduler_gamma = 0.5,
+                   scheduler_step_size:int = 10, scheduler_gamma:float = 0.5, loss_norm:bool = True,
                    verbose:bool=True):
         """
         Trains the VAE part of the model using the provided data.
@@ -303,6 +361,10 @@ class VAESIMCA(nn.Module):
         # create data indices for training and validation splits:
         indices = list(range(dataset_size))
         split = int(np.floor(val_ratio * dataset_size))
+
+        if split < 1 or (dataset_size - split) < 1:
+            raise ValueError(f"Dataset too small for validation split: {dataset_size} samples")
+
         np.random.shuffle(indices)
         train_indices, val_indices = indices[split:], indices[:split]
 
@@ -314,9 +376,12 @@ class VAESIMCA(nn.Module):
         train_loader = DataLoader(data, batch_size=batch_size, sampler=train_sampler)
         val_loader = DataLoader(data, batch_size=batch_size, sampler=valid_sampler)
 
-        # set up optimizer and scheduled to tune learnin rate
+        # set up optimizer and scheduled to tune learning rate
         optimizer = optim.Adam(self.parameters(), lr=lr)
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma)
+
+        # loss method
+        loss_fun = VAELoss(beta=beta, loss_norm=loss_norm)
 
         # loop over epochs
         best_loss = float('inf')
@@ -330,9 +395,7 @@ class VAESIMCA(nn.Module):
                 data = data.to(self.device)
                 optimizer.zero_grad()
                 recon_batch, mu, logvar, _ = self._forward(data)
-                recon_loss = F.binary_cross_entropy(recon_batch, data, reduction='sum')
-                kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-                loss = recon_loss + beta * kl_divergence
+                loss = loss_fun((recon_batch, mu, logvar), data)
                 loss.backward()
                 train_loss += loss.item()
                 optimizer.step()
@@ -348,9 +411,8 @@ class VAESIMCA(nn.Module):
                 for _, (data, _) in enumerate(val_loader):
                     data = data.to(self.device)
                     recon_batch, mu, logvar, _ = self._forward(data)
-                    recon_loss = F.binary_cross_entropy(recon_batch, data, reduction='sum')
-                    kl_divergence = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-                    val_loss += recon_loss + beta * kl_divergence
+                    loss = loss_fun((recon_batch, mu, logvar), data)
+                    val_loss += loss.item()
 
             # average validation loss
             val_loss = val_loss / len(val_loader.dataset)
@@ -361,7 +423,7 @@ class VAESIMCA(nn.Module):
                 print(f"Epoch {(epoch + 1):4d}/{nepochs:4d} - lr: {lr_loc:.10f} - train loss: {train_loss:.2f} - val loss: {val_loss:.2f}")
 
             if val_loss < best_loss:
-                # if validation loss is better than the previos best, set the new values for
+                # if validation loss is better than the previous best, set the new values for
                 # the best, best model and reset epochs counter
                 best_loss = val_loss
                 best_loss_epochs = 0
@@ -371,7 +433,7 @@ class VAESIMCA(nn.Module):
                 if verbose:
                     print(f"The validation loss is getting worse —  stop training.")
                 break
-            elif ((val_loss - best_loss) / best_loss > tol) or best_loss_epochs >= MAX_EPOCHS_UNTIL_BEST_LOSS:
+            elif best_loss_epochs >= MAX_EPOCHS_UNTIL_BEST_LOSS:
                 if verbose:
                     print(f"No improvements during last {best_loss_epochs} epochs —  stop training.")
                 break
@@ -396,7 +458,7 @@ class VAESIMCA(nn.Module):
         self.z_mean = Z.mean(axis=0)
         self.z_sd = Z.std(axis=0)
 
-        U, s, V = np.linalg.svd((Z - self.z_mean) / self.z_sd, full_matrices=False)
+        U, s, V = np.linalg.svd((Z - self.z_mean) / (self.z_sd + EPSILON), full_matrices=False)
         self.s = s
         self.V = np.transpose(V)
 
@@ -408,8 +470,6 @@ class VAESIMCA(nn.Module):
 
         f = h / h0 * Nh + q / q0 * Nq
         f0, Nf = getdistparams(f)
-        #Nf = Nh + Nq
-        #f0 = Nf
 
         self.hParams = (h0, Nh)
         self.qParams = (q0, Nq)
@@ -427,7 +487,9 @@ class VAESIMCA(nn.Module):
 
 
     def findlr(self, data_path:str, batch_size:int=10, beta:float=1.0,
-               num_iter:int=100, start_lr:float=1e-7, end_lr:float=100, weight_decay:float=1e-2):
+               num_iter:int=100, start_lr:float=1e-7, end_lr:float=100,
+               loss_norm:bool = True,
+               weight_decay:float=1e-2):
         """
         Applied FindLR method from "torch_lr_finder" package to find optimal learning rate.
 
@@ -457,11 +519,11 @@ class VAESIMCA(nn.Module):
 
         data = VAEInputTargetWrapper(self._get_dataset(data_path))
         train_loader = DataLoader(data, batch_size=batch_size)
-        criterion = VAELoss(beta = beta)
+        criterion = VAELoss(beta=beta, loss_norm=loss_norm)
 
-        optimizer = optim.Adam(self.parameters(), lr=1e-7, weight_decay=weight_decay)
+        optimizer = optim.Adam(self.parameters(), lr=start_lr, weight_decay=weight_decay)
         lr_finder = LRFinder(self, optimizer, criterion, device=self.device)
-        lr_finder.range_test(train_loader, end_lr=100, num_iter=num_iter)
+        lr_finder.range_test(train_loader, end_lr=end_lr, num_iter=num_iter)
         lr_finder.reset()
 
         return lr_finder
@@ -470,7 +532,7 @@ class VAESIMCA(nn.Module):
     def fit(self, data_path:str, nepochs:int=30, batch_size:int=10, lr:float=0.001,
                 val_ratio:float = 0.2, tol:float = 0.05, beta:float = 1.0,
                 scheduler_step_size:int = 10, scheduler_gamma:float = 0.5,
-                verbose:bool=True):
+                loss_norm:bool = True, verbose:bool=True):
         """
         Train VAESIMCA model and set proper model parameters, so it is ready for predictions.
 
@@ -494,6 +556,8 @@ class VAESIMCA(nn.Module):
             Step size for scheduler to adjust learning rate.
         scheduler_gamma : float, optional
             Gamma parameter for scheduler to adjust learning rate.
+        loss_norm : bool
+            Compute normalized loss or the conventional one (like in initial version).
         verbose : bool, optional
             If True, print detailed logs during training.
 
@@ -519,7 +583,7 @@ class VAESIMCA(nn.Module):
         # train VAE and simca parts
         self._train_vae(data=data, batch_size=batch_size, nepochs=nepochs, lr=lr, val_ratio=val_ratio,
                         scheduler_step_size=scheduler_step_size, scheduler_gamma=scheduler_gamma,
-                        tol=tol, beta=beta, verbose=verbose)
+                        tol=tol, beta=beta, loss_norm=loss_norm, verbose=verbose)
         self._train_simca(data=data)
 
 
@@ -545,6 +609,10 @@ class VAESIMCA(nn.Module):
         if alpha < 0.00001 or alpha > 0.999999:
             raise ValueError("Wrong value for parameter 'alpha' (must be between 0.00001 and 0.999999).")
 
+        if distance not in ["f", "q", "h"]:
+            raise ValueError(f"Invalid value for distance: '{distance}'. Must be 'f', 'q', or 'h'.")
+
+        self.eval()
         data = self._get_dataset(data_path)
 
         labels = [os.path.splitext(os.path.basename(path))[0] for path, label in data.imgs]
@@ -552,18 +620,19 @@ class VAESIMCA(nn.Module):
         class_labels = [classes[i] for i in data.targets]
 
         Z, E = self._getdecomp(data)
-        T = np.dot((Z - self.z_mean) / self.z_sd, self.V)
+        T = np.dot((Z - self.z_mean) / (self.z_sd + EPSILON), self.V)
         U = np.dot(T, np.diag(1 / self.s))
 
         h = (U ** 2).sum(axis=1)
         q = (E ** 2).sum(axis=1)
 
-        return VAESIMCARes(self.img_size, Z, E, T, U, q, h, self.qParams, self.hParams, self.fParams, alpha, labels, class_labels, classes, distance)
+        return VAESIMCARes(self.classname, self.img_size, Z, E, T, U, q, h, self.qParams, self.hParams, self.fParams, alpha, labels, class_labels, classes, distance)
 
 
     @staticmethod
     def gridsearch(train_path:str, test_path:str, classname:str, encoder_class:nn.Module, decoder_class:nn.Module,
-                   img_size:tuple, transform:callable, nepochs:int=30, scheduler_step_size = 10, scheduler_gamma = 0.5, verbose:bool=True,
+                   img_size:tuple, transform:callable, nepochs:int=30, scheduler_step_size = 10, scheduler_gamma = 0.5,
+                   loss_norm:bool=True, verbose:bool=True,
                    lr_seq = [0.001], ld_seq =[4, 8, 16], bs_seq = [10, 20], beta_seq = [0.5, 1.0], niter:int=3,
                    ) -> pd.DataFrame:
         """
@@ -591,6 +660,8 @@ class VAESIMCA(nn.Module):
             Step size for scheduler to adjust learning rate.
         scheduler_gamma : float, optional
             Gamma parameter for scheduler to adjust learning rate.
+        loss_norm : bool
+            Compute normalized loss or the conventional one (like in initial version).
         verbose : bool, optional
             If True, prints detailed logs during the grid search.
 
@@ -638,7 +709,9 @@ class VAESIMCA(nn.Module):
             sys.stdout.flush()
 
         # get test set classes and combine with training class
-        test_classes = [f for f in os.listdir(test_path) if os.path.isdir(test_path + "/" + f)]
+        test_data = datasets.ImageFolder(root=test_path, transform=transform) if os.path.isdir(test_path) \
+            else CSVImageDataset(csv_path=test_path, img_size=img_size, transform=transform)
+        test_classes = test_data.classes
 
         if len(test_classes) < 1:
             raise ValueError("No subdirectories found in the path specified by 'test_path' parameter.")
@@ -665,6 +738,16 @@ class VAESIMCA(nn.Module):
         g_n = []
         g_in = []
         g_inp = []
+
+        f_iter = []
+        f_comb = []
+        f_beta = []
+        f_bs = []
+        f_lr = []
+        f_ld = []
+        f_sens = []
+        f_spec = []
+        f_eff = []
 
         # best model
         sens_best = (0, [])
@@ -694,14 +777,16 @@ class VAESIMCA(nn.Module):
 
                 try:
                     m.fit(data_path=train_path, nepochs=nepochs, beta=beta, lr=lr, batch_size=int(batch_size),
-                         scheduler_gamma=scheduler_gamma, scheduler_step_size=scheduler_step_size, verbose=False)
+                         scheduler_gamma=scheduler_gamma, scheduler_step_size=scheduler_step_size,
+                         loss_norm=loss_norm, verbose=False)
+
                 except Exception as error:
                     print("A critical problem occured when training the model with following parameters:")
                     print(f"lr = {lr} ld = {ld} beta = {beta} batch size = {batch_size}")
                     print(error)
 
-                rc = m.predict(train_path).stat()
-                rt = m.predict(test_path).stat()
+                rc, fomc = m.predict(train_path).stat()
+                rt, fomt = m.predict(test_path).stat()
 
                 # save results for the calibration/training set
                 g_iter.append(i)
@@ -734,23 +819,34 @@ class VAESIMCA(nn.Module):
                     g_inp.append(rt[c][1] / rt[c][0])
                     n = n + 1
 
-                    if c == classname:
-                        sens = rt[c][1] / rt[c][0]
-                    else:
-                        alt_in += rt[c][1]
-                        alt_n += rt[c][0]
 
-                # compute overall specificity and efficiency
-                spec = 1 - alt_in / alt_n
-                eff = math.sqrt(sens * spec)
+                # get foms for test set
+                sens = fomt["sens"]
+                spec = fomt["spec"]
+                eff  = fomt["eff"]
 
                 # adjust best FoM values
-                if (spec > spec_best[0]):
+                if spec and spec > spec_best[0]:
                     spec_best = (spec, [i, lr, ld, beta, batch_size])
-                if (sens > sens_best[0]):
+                if sens and sens > sens_best[0]:
                     sens_best = (sens, [i, lr, ld, beta, batch_size])
-                if (eff > eff_best[0]):
+                if eff and eff > eff_best[0]:
                     eff_best = (eff, [i, lr, ld, beta, batch_size])
+
+                f_iter.append(i)
+                f_comb.append(p)
+                f_beta.append(beta)
+                f_bs.append(batch_size)
+                f_lr.append(lr)
+                f_ld.append(ld)
+                f_sens.append(sens)
+                f_spec.append(spec)
+                f_eff.append(eff)
+
+                # free memory
+                del m
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                gc.collect()
 
             if verbose:
                 show_progress(i, ncombs, ncombs, sens_best[0], spec_best[0], eff_best[0]),
@@ -763,7 +859,8 @@ class VAESIMCA(nn.Module):
             print(f"Best efficiency:   {eff_best[0]:.3f} - lr={eff_best[1][1]:6f} ld={eff_best[1][2]:4.0f} beta={eff_best[1][3]:.1f} bs={eff_best[1][4]:4.0f}")
 
         res_df = pd.DataFrame({"iter": g_iter, "comb": g_comb, "set": g_set, "class": g_class, "beta": g_beta, "bs": g_bs, "lr": g_lr, "ld": g_ld, "n": g_n,  "in": g_in, "inp": g_inp})
-        return res_df
+        fom_df = pd.DataFrame({"iter": f_iter, "comb": f_comb, "beta": f_beta, "bs": f_bs, "lr": f_lr, "ld": f_ld, "sens": f_sens, "spec": f_spec, "eff": f_eff})
+        return (res_df, fom_df)
 
 
 
@@ -847,7 +944,7 @@ class VAESIMCARes:
     plotAcceptance(plt, dolog=False, colors=None, markers=None)
         Plots an acceptance graph showing the explained and residual distances and decision boundary.
     """
-    def __init__(self, img_size:tuple, Z:np.ndarray, E:np.ndarray, T:np.ndarray, U:np.ndarray, q:np.array, h:np.array,
+    def __init__(self, target_class:str, img_size:tuple, Z:np.ndarray, E:np.ndarray, T:np.ndarray, U:np.ndarray, q:np.array, h:np.array,
                  qParams:tuple, hParams:tuple, fParams:tuple, alpha:float, labels:list, class_labels:list, classes:list,
                  crit:str):
 
@@ -856,6 +953,7 @@ class VAESIMCARes:
         q0, Nq = qParams
         f0, Nf = fParams
 
+        self.target_class = target_class
         self.img_size = img_size
         self.n = n
         self.Z = Z
@@ -893,13 +991,29 @@ class VAESIMCARes:
             A dictionary with classes as keys and lists of counts: total, within range, and out of range.
         """
         stat = {}
+
+        TN = 0
+        TP = 0
+        FN = 0
+        FP = 0
         for c in self.classes:
             decisions = [self.regular[i] for i, label in enumerate(self.class_labels) if label == c]
             total = len(decisions)
             accepted = sum(decisions)
             rejected = total - accepted
             stat[c] = [total, accepted, rejected]
-        return stat
+
+            if c == self.target_class:
+                TP = TP + accepted
+                FN = FN + rejected
+            else:
+                TN = TN + rejected
+                FP = FP + accepted
+
+        sens = TP / (TP + FN) if (TP + FN) > 0 else None
+        spec = TN / (TN + FP) if (TN + FP) > 0 else None
+        eff = math.sqrt(sens * spec) if sens and spec else None
+        return stat, {"TP":TP, "FN":FN, "TN":TN, "FP":FP, "sens":sens, "spec":spec, "eff":eff}
 
 
     def summary(self):
@@ -908,7 +1022,8 @@ class VAESIMCARes:
 
         Displays the number of data points per class and how many are accepted/rejected by the model.
         """
-        stats = self.stat()
+        stats, foms = self.stat()
+
         slen = max(6, max(len(x) for x in self.classes) + 1)
         dlen = max(4, int(math.log10(self.n)) + 1)
         print(f"\n{'class':<{slen}s} {'n':>{dlen}s} {'in':>{dlen}s} {'in (%)':>6s} {'out':>{dlen}s} {'out (%)':>7s}")
@@ -917,6 +1032,11 @@ class VAESIMCARes:
             in_pct = 100 * in_range / total if total > 0 else 0
             out_pct = 100 * out_of_range / total if total > 0 else 0
             print(f"{c:<{slen}s} {total:{dlen}d} {in_range:{dlen}d} {in_pct:6.1f} {out_of_range:{dlen}d} {out_pct:7.1f}")
+
+        print("")
+        if foms["sens"]: print(f"sensitivity: {foms['sens']:.3f}")
+        if foms["spec"]: print(f"specificity: {foms['spec']:.3f}")
+        if foms["eff"]:  print(f"efficiency: {foms['eff']:.3f}")
 
 
     def as_df(self):
@@ -966,26 +1086,34 @@ class VAESIMCARes:
             raise ValueError(f"Colors for each of the {len(self.classes)} must be provided.")
 
         params = {'q': self.qParams, 'h': self.hParams, 'f': self.fParams}
-        distances = {'q': self.q, 'h': self.h, 'f': self.f}[distance]
+        distances = {'q': self.q / self.qParams[0], 'h': self.h / self.hParams[0], 'f': self.f / self.fParams[0]}[distance]
         title_map = {'q': "Residual", 'h': "Explained", 'f': "Full"}
 
-        start = 0
-        for i, c in enumerate(self.classes):
-            y = [distances[j] for j, label in enumerate(self.class_labels) if label == c]
-            x = range(start, start + len(y))
-            plt.bar(x, y, color=colors[i % len(colors)], label=c)
-            if show_labels:
-                labels = [self.labels[j] for j, label in enumerate(self.class_labels) if label == c]
-                plotlabels(plt, x, y, labels)
-            start += len(y)
+        # map each class to a color
+        class_to_color = {
+            cls: colors[i] for i, cls in enumerate(self.classes)
+        }
+
+        x = np.arange(len(distances))
+        colors = [class_to_color[cls] for cls in self.class_labels]
+        plt.bar(x, distances, color = colors)
+
+        if show_labels:
+            plotlabels(plt, x, distances, self.labels)
 
         if show_boundaries:
             u0, Nu = params[distance]
-            lim = getlimits(u0, Nu, alpha = self.alpha)
+            lim = getlimits(u0, Nu, alpha = self.alpha) / u0
             xr = plt.xlim()
             plt.plot(xr, [lim, lim], 'k--', linewidth=0.5)
 
-        plt.legend(loc=legend_loc)
+
+        legend_handles = [
+            mpatches.Patch(color=color, label=cls)
+            for cls, color in class_to_color.items()
+        ]
+
+        plt.legend(handles=legend_handles, loc = legend_loc)
         plt.title(f"{title_map[distance]} distance")
         plt.ylabel(f"{distance}-distance")
         plt.xlabel("Objects")
@@ -1066,7 +1194,7 @@ class VAESIMCARes:
             plt.ylabel("Residual distance, q/q0")
 
 
-    def plotError(self, plt:matplotlib.pyplot, classname:str, object_label:str):
+    def plotError(self, plt:matplotlib.pyplot, ind:int = None, classname:str = None, object_label:str = None):
         """
         Show image with reconstruction error for object with given label and class name.
 
@@ -1086,19 +1214,28 @@ class VAESIMCARes:
 
         """
 
-        if not classname in self.classes:
+        if ind is None and (classname is None or object_label is None):
+            raise ValueError("You need to specify either object index or class and object labels.")
+
+        if classname and not classname in self.classes:
             raise ValueError("Can not find class with name '{classname}' in this result object.")
 
-        ind = [i for i in range(self.n) if self.class_labels[i] == classname and self.labels[i] == object_label]
-        if len(ind) < 1:
-            raise ValueError("Can not find object with label '{object_label}' among elements of class '{classname}'")
+        if not ind is None:
+            if ind < 0 or ind > self.n - 1:
+                raise ValueError("Wrong value for object index.")
+            classname = self.class_labels[ind]
+            object_label = self.labels[ind]
+        else:
+            ind = [i for i in range(self.n) if self.class_labels[i] == classname and self.labels[i] == object_label]
+            if len(ind) < 1:
+                raise ValueError("Can not find object with label '{object_label}' among elements of class '{classname}'")
+            ind = ind[0]
 
         mn = np.min(self.E)
         mx = np.max(self.E)
-        e = self.E[ind[0], :].reshape(self.img_size[0], self.img_size[1])
-
+        e = self.E[ind, :].reshape(self.img_size[0], self.img_size[1])
         plt.imshow(e)
-        plt.clim([mn, mx])
         plt.colorbar()
         plt.title(f"{classname}:{object_label}")
+        plt.clim([mn, mx])
 
