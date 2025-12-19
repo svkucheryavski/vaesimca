@@ -6,7 +6,7 @@ The package *vaesimca* implements a method for creating one-class classification
 Although the method we proposed is versatile, the package implements VAESIMCA method for analysis of images. It can be installed from [PyPI](https://pypi.org) using `pip` or any other package manager compatible with PyPI, e.g.:
 
 ```
-pip3 install vaesimca
+pip install vaesimca
 ```
 
 It requires `numpy`, `scipy`, `torch`, `torchvision`, `pandas`, `torch_lr_finder` and `matplotlib`,  which will be automatically installed as dependencies.
@@ -20,10 +20,22 @@ Simply download the dataset and unzip it to your working directory, where you ha
 
 ## Releases
 
+**1.0.0** (18/12/2025)
+* fixed a bug leading to lack of reproducibility when `predict()` is called several times.
+* when fitting a model, the loss value by default is now normalized to image size and batch size which makes it more stable and reproducible. If you want to use the previous way of computing loss, provide `loss_norm = False` to the method `fit()`.
+* method `gridsearch()` can now be used with CSV based data.
+* method `plotDistance()` shows objects in the same order as they were loaded without regrouping them.
+* method `plotError()` now also works with object index (e.g. show error for object `12`).
+* method `stat()` returns two outcomes instead of one: the number of accepted/rejected objects for each class (like in previous version) and the figures of merits (TN, FN, TP, FP, sensitivity, specificity and efficiency).
+* method `gridsearch()` also returns two data frames, one with all class based details like in previous version and second one with figures of merits.
+* method `summary()` now also shows figures of merits (sensitivity, specificity and efficiency).
+* added memory and CUDA device cache cleaning after each grid search iteration to avoid memory leaks.
+* several smaller improvements and bug fixes.
+* see updated [demo.ipynb](https://github.com/svkucheryavski/vaesimca/blob/main/demo/demo) for all details.
+
 **0.4.2** (2/6/2025)
 * added possibility to load data from CSV files.
 * added learning rate finder option.
-* see [demo.ipynb](https://github.com/svkucheryavski/vaesimca/blob/main/demo/demo) for all details.
 
 **0.3.7**
 * fixed a bug in saving state dictionary of the best model during training loop.
