@@ -85,8 +85,8 @@ class TestVAESIMCARes(unittest.TestCase):
     def test_statistical_output(self):
         """ Test the statistics calculation """
 
-        result = VAESIMCARes((2, 3), self.Z, self.E, self.T, self.U, self.q, self.h, self.qParams, self.hParams, self.fParams, self.alpha, self.labels, self.class_labels, self.classes, "f")
-        stats = result.stat()
+        result = VAESIMCARes("A", (2, 3), self.Z, self.E, self.T, self.U, self.q, self.h, self.qParams, self.hParams, self.fParams, self.alpha, self.labels, self.class_labels, self.classes, "f")
+        stats, foms = result.stat()
         self.assertEqual(stats['A'][0], 2)  # Total count in class A
         self.assertEqual(stats['B'][0], 1)  # Total count in class B
 

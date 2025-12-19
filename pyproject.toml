@@ -1,26 +1,95 @@
 [build-system]
-requires = ["hatchling", "numpy", "scipy", "matplotlib", "torch", "torchvision", "pandas", "torch_lr_finder"]
+requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-license = "MIT"
 name = "vaesimca"
 version = "1.0.0"
-authors = [
-  { name="Sergey Kucheryavskiy", email="svkucheryavski@gmail.com" },
-]
-description = "Implementation of VAE-SIMCA one class classification method"
+description = "Implementation of VAESIMCA one class classification method"
 readme = "README.md"
 requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+   { name="Sergey Kucheryavskiy", email="svkucheryavski@gmail.com" },
+]
+
+keywords = ["deep-learning", "autoencoder", "one-class-classification", "anomaly-detection", "pytorch", "simca", "ddsimca"]
+
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License",
-    "Operating System :: OS Independent",
+   "Development Status :: 5 - Production/Stable",
+   "Intended Audience :: Science/Research",
+   "Topic :: Scientific/Engineering :: Artificial Intelligence",
+   "Programming Language :: Python :: 3",
+   "Programming Language :: Python :: 3.8",
+   "Programming Language :: Python :: 3.9",
+   "Programming Language :: Python :: 3.10",
+   "Programming Language :: Python :: 3.11",
+   "Programming Language :: Python :: 3.12",
+   "License :: OSI Approved :: MIT License",
+   "Operating System :: OS Independent",
+]
+
+# Runtime dependencies
+dependencies = [
+    "numpy>=1.19.0",
+    "scipy>=1.6.0",
+    "matplotlib>=3.3.0",
+    "torch>=1.9.0",
+    "torchvision>=0.10.0",
+    "pandas>=1.2.0",
+    "Pillow>=8.0.0",
+    "torch-lr-finder>=0.2.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
+    "black>=22.0.0",
+    "flake8>=4.0.0",
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/svkucheryavski/vaesimca"
-"Bug Tracker" = "https://github.com/svkucheryavski/pcv/vaesimca"
+Homepage = "https://github.com/svkucheryavski/vaesimca"
+Documentation = "https://github.com/svkucheryavski/vaesimca"
+Repository = "https://github.com/svkucheryavski/vaesimca"
+"Bug Tracker" = "https://github.com/svkucheryavski/vaesimca/issues"
 
-[tool.setuptools]
-license-files = []
+# Hatchling-specific configuration
+[tool.hatch.build.targets.wheel]
+packages = ["vaesimca"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/vaesimca",
+    "/tests",
+    "/demo",
+    "README.md",
+    "LICENSE",
+]
+
+# Test configuration
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+# Code formatting
+[tool.black]
+line-length = 120
+target-version = ['py38']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hatch
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
