@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 license = "MIT"
 name = "vaesimca"
-version = "0.4.2"
+version = "1.0.0"
 authors = [
   { name="Sergey Kucheryavskiy", email="svkucheryavski@gmail.com" },
 ]
