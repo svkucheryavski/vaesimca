@@ -31,7 +31,7 @@ Simply download the dataset and unzip it to your working directory, where you ha
 * method `summary()` now also shows figures of merits (sensitivity, specificity and efficiency).
 * added memory and CUDA device cache cleaning after each grid search iteration to avoid memory leaks.
 * several smaller improvements and bug fixes.
-* see updated [demo.ipynb](https://github.com/svkucheryavski/vaesimca/blob/main/demo/demo) for all details.
+* see updated [demo.ipynb](https://github.com/svkucheryavski/vaesimca/blob/main/demo/demo.ipynb) for all details.
 
 **0.4.2** (2/6/2025)
 * added possibility to load data from CSV files.
