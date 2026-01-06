@@ -7,21 +7,21 @@ from torch import nn, sigmoid
 from torch.nn import functional as F
 from torch_lr_finder import LRFinder
 
-from vaesimca import VAESIMCA, VAESIMCARes, getdistparams
+from vaesimca import VAESIMCA, VAESIMCARes, get_distparams
 
-class TestGetDistParams(unittest.TestCase):
+class Testget_distparams(unittest.TestCase):
     def test_normal_distribution(self):
         """ Test with a normal distribution of values """
         np.random.seed(0)
         u = np.random.normal(loc=0, scale=1, size=10000)
-        mean, nu = getdistparams(u**2)
+        mean, nu, up = get_distparams(u**2)
         self.assertAlmostEqual(mean, 1, places=1)
         self.assertAlmostEqual(nu, 1, places=1)
 
     def test_single_value_array(self):
         """ Test with an array where all elements are the same """
         u = np.array([5] * 100)
-        mean, nu = getdistparams(u)
+        mean, nu, up = get_distparams(u)
         self.assertEqual(mean, 5)
         self.assertEqual(nu, 1)
 
@@ -74,9 +74,9 @@ class TestVAESIMCARes(unittest.TestCase):
         self.U = np.array([[1, 2, 3], [1, 2, 3]])
         self.q = np.array([0.1, 0.2, 0.3])
         self.h = np.array([0.4, 0.5, 0.6])
-        self.qParams = (0.2, 1)
-        self.hParams = (0.5, 1)
-        self.fParams = (0.3, 1)
+        self.qParams = (0.2, 1, np.array([1, 2, 3]))
+        self.hParams = (0.5, 1, np.array([1, 2, 3]))
+        self.fParams = (0.3, 1, np.array([1, 2, 3]))
         self.alpha = 0.05
         self.labels = ['sample1', 'sample2', 'sample3']
         self.class_labels = ['A', 'A', 'B']
@@ -85,7 +85,7 @@ class TestVAESIMCARes(unittest.TestCase):
     def test_statistical_output(self):
         """ Test the statistics calculation """
 
-        result = VAESIMCARes("A", (2, 3), self.Z, self.E, self.T, self.U, self.q, self.h, self.qParams, self.hParams, self.fParams, self.alpha, self.labels, self.class_labels, self.classes, "f")
+        result = VAESIMCARes("A", (2, 3), self.Z, self.E, self.T, self.U, self.q, self.h, self.qParams, self.hParams, self.fParams, self.alpha, self.labels, self.class_labels, self.classes, "f", "moments")
         stats, foms = result.stat()
         self.assertEqual(stats['A'][0], 2)  # Total count in class A
         self.assertEqual(stats['B'][0], 1)  # Total count in class B

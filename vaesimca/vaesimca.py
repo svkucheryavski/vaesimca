@@ -4,21 +4,23 @@ import math
 import torch
 import copy
 import numpy as np
-import matplotlib.pyplot
 import torch.optim as optim
 import pandas as pd
 import functools
 import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import numpy.typing as npt
 import gc
 
 from PIL import Image
 from torch import nn
-from torch.nn import functional as F
-from torchvision import datasets
+from torch.nn import Module, functional as F
+from torchvision import datasets, transforms
 from torch.utils.data import Dataset, SubsetRandomSampler, DataLoader
 from torch_lr_finder import LRFinder
 from scipy.stats.distributions import chi2
+from matplotlib.axes import Axes
+from matplotlib.image import AxesImage
 
 # how many epochs without improving best validation loss to run
 # the training
@@ -26,44 +28,85 @@ MAX_EPOCHS_UNTIL_BEST_LOSS = 30
 
 # default plot colors and markers
 MARKERS = ['o', 's', '^', 'd', '>', 'h', 'p', 'v']
-COLORS = ['tab:blue', 'tab:green', 'tab:orange', 'tab:red', 'tab:purple', 'tab:olive', 'tab:pink', 'tab:gray']
+COLORS = ['tab:blue', 'tab:green', 'tab:orange', 'tab:red', 'tab:purple', 'tab:olive', 'tab:pink',
+          'tab:gray']
+
+MAIN_COLOR = 'tab:blue'
 
 # a small number to add to sd to avoid division by zero
 EPSILON = 1e-12
 
+# expected alpha values - this is needed for quantile based limits
+alpha_expected = np.array([0.10, 0.05, 0.01, 0.001])
 
-def plotlabels(plt:matplotlib.pyplot, x:npt.NDArray[np.float64], y:npt.NDArray[np.float64], labels:list, dy:float = None )-> None:
+def plot_labels(ax:Axes, x:npt.NDArray, y:npt.NDArray,
+               labels:npt.NDArray|list, dy:float = 0 )-> None:
     """
     Shows labels on top of data points with coordinates (x, y)
     """
 
-    if not dy:
-        dy = (y.max() - y.min()) * 0.02
-
     for i in range(0, len(x)):
-        plt.text(x[i], y[i] + dy, labels[i], color="gray", ha = "center", fontsize = "medium")
+        ax.text(x[i], y[i] + dy, labels[i], color="gray", ha = "center", fontsize = "medium")
 
 
-def getlimits(u0:float, Nu:float, alpha:float = 0.05) -> float:
+def get_limits(u0:float, Nu:float, alpha:float = 0.05, up:npt.NDArray|None = None, method:str = "moments"):
     """
     Compute statistical limits for extreme objects and outliers based on chi-square distribution.
     """
-    return chi2.ppf(1 - alpha, Nu) * u0 / Nu
+    if method == "moments" or up is None:
+        return chi2.ppf(1 - alpha, Nu) * u0 / Nu
+    else:
+        ind = np.where(np.abs(alpha_expected - alpha) < 0.00000001)[0]
+        if len(ind) != 1:
+            raise ValueError("Method 'quantiles' can only be used with alpha = 0.10, 0.05, 0.01, or 0.001")
+        return up[ind[0]]
 
 
-def getdistparams(u: npt.NDArray[np.float64]) -> tuple[float, float]:
+def get_group_colors(groups:list) -> dict:
+   """
+   Returns dictionary with dedicated color for each group name.
+   """
+   n = len(groups)
+
+   if n == 1:
+      colors = ['tab:blue']
+   elif n == 2:
+      colors = ['tab:blue', 'tab:red']
+   elif n == 3:
+      colors = ['tab:blue', 'tab:orange', 'tab:red']
+   elif n <= 10:
+      cmap = plt.get_cmap("tab10", n)
+      colors = [cmap(i) for i in range(n)]
+   elif n <= 20:
+      cmap = plt.get_cmap("tab20", n)
+      colors = [cmap(i) for i in range(n)]
+   else:
+      raise ValueError("Number of groups is too large (>20) for distingushing them with colors.")
+
+   return dict(zip(groups, colors))
+
+
+def get_distparams(u: npt.NDArray[np.float64]) -> tuple[float, float, npt.NDArray]:
     """
-    Computes parameters of a scaled chi-square distribution that approximate the distribution of the distance values using the method of moments.
+    Computes parameters of a scaled chi-square distribution that approximate the distribution of
+    the distance values using the method of moments as well as a set of quantiles for quantile
+    based estimation of critical values.
 
     Parameters
     ----------
-    u : A vector (1D array) of distances to compute the distribution parameters for.
+        u : NDAarray
+            A vector (1D array) of distances to compute the distribution parameters for.
 
     Returns
     -------
-    A tuple containing two estimated parameters:
-    - u0 (float): The mean of the input distances.
-    - Nu (float): The estimated number of degrees of freedom for chi-squared distribution.
+    A tuple containing two estimated parameters and array with quantiles:
+
+    u0 : float
+        The mean of the input distances.
+    Nu : float
+        The estimated number of degrees of freedom for chi-squared distribution.
+    up : NDArray
+        Array with the 90th, 95th, 99th and 99.9th percentiles.
 
     Raises
     ------
@@ -74,7 +117,8 @@ def getdistparams(u: npt.NDArray[np.float64]) -> tuple[float, float]:
     -----
     The function calculates the mean (u0) and variance (vu) of the values in the input array `u`.
     If the coefficient of variation is very small (less than 1e-6), the function returns (u0, 1) to avoid
-    division by zero in subsequent calculations. Otherwise, it calculates `Nu` as 2 * u0^2 / vu.
+    division by zero in subsequent calculations. Otherwise, it calculates using the moments approach
+    described in DD-SIMCA tutorial.
     """
 
     if u.size == 0:
@@ -83,11 +127,12 @@ def getdistparams(u: npt.NDArray[np.float64]) -> tuple[float, float]:
     u0 = u.mean()
     vu = ((u - u0)**2).mean()
     u02 = u0 ** 2
+    up = np.quantile(u, 1 - alpha_expected)
 
     if u02 < EPSILON or vu < EPSILON or math.sqrt(vu/u02) < EPSILON:
-        return (u0, 1)
+        return (u0, 1, up)
 
-    return (u0, 2 * u02 / vu)
+    return (u0, 2 * u02 / vu, up)
 
 
 class VAEInputTargetWrapper(torch.utils.data.Dataset):
@@ -102,66 +147,69 @@ class VAEInputTargetWrapper(torch.utils.data.Dataset):
         return len(self.dataset)
 
 
+
 class VAELoss:
-    """
-    Unified VAE loss computation with proper configuration.
+    """ Class for computing loss values """
 
-    Parameters
-    ----------
-    beta : float
-        Weight for KL divergence term
-    batch_size : int
-        Batch size (used for normalized loss)
-    """
+    def __init__(self, beta: float = 1.0):
+        """
+        VAE loss for continuous-valued images (grayscale or RGB) using Gaussian likelihood.
 
-    def __init__(self, beta:float =1.0, loss_norm:bool = True):
+        Parameters
+        ----------
+        beta : float
+            Weight for the KL divergence term (beta-VAE)
+        """
         if beta < 0:
             raise ValueError(f"Beta must be non-negative, got {beta}")
-
         self.beta = beta
-        self.loss_norm = loss_norm
 
     def __call__(self, model_output, target):
+        """
+        Compute per-sample VAE loss.
+
+        Parameters
+        ----------
+        model_output : tuple
+            Tuple of (reconstructed_images, mu, logvar) from the VAE decoder/encoder
+        target : torch.Tensor
+            Original images, shape (batch_size, channels, height, width)
+        """
         recon_x, mu, logvar = model_output
-        batch_size = recon_x.shape[0]
+        batch_size = recon_x.size(0)
 
-        if self.loss_norm:
-            # reconstruction loss per sample
-            recon_loss = F.binary_cross_entropy(recon_x, target, reduction='none')
-            recon_loss = recon_loss.view(batch_size, -1).sum(dim=1)
+        # reconstruction loss per pixel per sample
+        recon_loss = F.mse_loss(recon_x, target, reduction='none')
+        recon_loss = recon_loss.view(batch_size, -1).sum(dim=1)
 
-            # KL divergence per sample
-            kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
+        # KL divergence per sample
+        kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
 
-            # final loss
-            return (recon_loss + self.beta * kl_div).mean()
-
-        # previous version
-        recon_loss = F.binary_cross_entropy(recon_x, target, reduction='sum')
-        kl_div = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-        return recon_loss + self.beta * kl_div
-
+        # Return mean over batch (per-sample ELBO)
+        return (recon_loss + self.beta * kl_div).mean()
 
 
 
 class CSVImageDataset(Dataset):
-    """
-    Class to handle image dataset stored as CSV file (each row is an image)
+    """ Class to handle image dataset stored as CSV file (each row is an image). """
 
-    It is assumed that class names are located in the first column of the data frame.
+    def __init__(self, csv_path:str, img_size:tuple, transform=None, index_col:int = 0):
+        """
+        Creates an instance of `CSVImageDataset` class. It is assumed that class names are located
+        in the first column of the data frame.
 
-    Parameters
-    ----------
-    csv_path : str
-        Full path to CSV file with data values.
-    transform : callable
-        A function/transform that preprocess the data.
-    """
-
-    def __init__(self, csv_path:str, img_size:list, transform=None):
+        Parameters
+        ----------
+        csv_path : str
+            Full path to CSV file with data values.
+        transform : callable, optional
+            A function/transform that preprocess the data.
+        index_col : int, optional
+            Index of column containing row labels.
+        """
 
         # load data from CSV file
-        self.data = pd.read_csv(csv_path, index_col=0)
+        self.data = pd.read_csv(csv_path, index_col=index_col)
 
         # check image size
         npixels_expected = np.prod(img_size)
@@ -208,35 +256,38 @@ class CSVImageDataset(Dataset):
 
 
 class VAESIMCA(nn.Module):
-    """
-    A variational autoencoder class with added functionalities to use it as DD-SIMCA one-class classifier.
+    """ Class for VAESIMCA model. """
 
-    Parameters
-    ----------
-    encoder_class : nn.Module
-        The class that defines the encoder structure. It must take 'img_size' and 'latent_dim' as arguments.
-    decoder_class : nn.Module
-        The class that defines the decoder structure. It must take 'img_size' and 'latent_dim' as arguments.
-    classname : str
-        The name of the target class the model should be trained for.
-    img_size : tuple
-        A tuple (width, height, num_channels) defining the input image size.
-    latent_dim : int
-        The dimensionality of the latent space.
-    transform : callable
-        A function/transform that preprocess the data.
+    def __init__(self, encoder_class:Module, decoder_class:Module, classname:str, img_size:tuple,
+                 latent_dim:int, transform: transforms.Compose, device:str|None=None):
+        """
+        Creates an instance of `VAESIMCA` class.
 
-    Raises
-    ------
-    ValueError
-        If the input image size or latent dimensions do not meet the requirements.
+        Parameters
+        ----------
+        encoder_class : nn.Module
+            The class that defines the encoder structure. It must take 'img_size' and 'latent_dim' as arguments.
+        decoder_class : nn.Module
+            The class that defines the decoder structure. It must take 'img_size' and 'latent_dim' as arguments.
+        classname : str
+            The name of the target class the model should be trained for.
+        img_size : tuple
+            A tuple (width, height, num_channels) defining the input image size.
+        latent_dim : int
+            The dimensionality of the latent space.
+        transform : callable
+            A function/transform that preprocess the data.
+        device: str, optional
+            Name of device to run computation on (if not set, will be detected automatically).
+        Raises
+        ------
+        ValueError
+            If the input image size or latent dimensions do not meet the requirements.
 
-    """
-
-    def __init__(self, encoder_class:nn.Module, decoder_class:nn.Module, classname:str, img_size:tuple,
-                 latent_dim:int, transform: callable, device=None):
+        """
 
         super(VAESIMCA, self).__init__()
+
         # initialization checks
         if len(img_size) != 3:
             raise ValueError("Parameter 'img_size' should include three values (width, height, num_channels).")
@@ -312,7 +363,7 @@ class VAESIMCA(nn.Module):
         return self.decoder(z), mu, logvar, z
 
 
-    def _getdecomp(self, data:Dataset) -> tuple[np.array, np.array]:
+    def _getdecomp(self, data:Dataset) -> tuple[npt.NDArray, npt.NDArray]:
         """
         Decomposes the input data using the VAE model to get latent representations and reconstruction errors.
 
@@ -323,14 +374,17 @@ class VAESIMCA(nn.Module):
 
         Returns
         -------
-        tuple
-            Z (numpy array): Latent representations of all data items.
-            E (numpy array): Reconstruction errors of all data items.
+        tuple with two elements
+
+        Z : NDArray
+            Latent representations of all data items (matrix nrows x latent dimension size).
+        E : NDArray
+            Reconstruction errors of all data items (matrix nrows x npredictors)
         """
 
         data_loader = torch.utils.data.DataLoader(data, batch_size=1, shuffle=False)
-        Z = np.zeros((len(data), self.latent_dim))
-        E = np.zeros((len(data), self.npixels * self.img_size[2]))
+        Z = np.zeros((len(data_loader), self.latent_dim))
+        E = np.zeros((len(data_loader), self.npixels * self.img_size[2]))
 
         self.eval()
         with torch.no_grad():
@@ -348,7 +402,7 @@ class VAESIMCA(nn.Module):
 
     def _train_vae(self, data:Dataset, batch_size:int=10, nepochs:int=30, lr:float=0.001,
                    val_ratio:float = 0.2, tol:float = 0.05, beta:float = 1.0,
-                   scheduler_step_size:int = 10, scheduler_gamma:float = 0.5, loss_norm:bool = True,
+                   scheduler_step_size:int = 10, scheduler_gamma:float = 0.5,
                    verbose:bool=True):
         """
         Trains the VAE part of the model using the provided data.
@@ -356,10 +410,10 @@ class VAESIMCA(nn.Module):
 
         dataset_size = len(data)
         if verbose:
-            print(f"Training VAE model (nimg: {len(data)} dim: {self.latent_dim}, epochs: {nepochs})")
+            print(f"Training VAE model (nimg: {dataset_size} dim: {self.latent_dim}, epochs: {nepochs})")
 
         # create data indices for training and validation splits:
-        indices = list(range(dataset_size))
+        indices = np.arange(dataset_size)
         split = int(np.floor(val_ratio * dataset_size))
 
         if split < 1 or (dataset_size - split) < 1:
@@ -381,46 +435,53 @@ class VAESIMCA(nn.Module):
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma)
 
         # loss method
-        loss_fun = VAELoss(beta=beta, loss_norm=loss_norm)
+        loss_fun = VAELoss(beta=beta)
 
         # loop over epochs
         best_loss = float('inf')
         best_loss_epochs = 0
+
         for epoch in range(nepochs):
             self.train()
-            train_loss = 0
+            total_train_loss = 0.0
+            total_train_samples = 0
 
             # loop throw batches
-            for _, (data, _) in enumerate(train_loader):
-                data = data.to(self.device)
+            for data_batch, _ in train_loader:
+                data_batch = data_batch.to(self.device)
                 optimizer.zero_grad()
-                recon_batch, mu, logvar, _ = self._forward(data)
-                loss = loss_fun((recon_batch, mu, logvar), data)
+                recon_batch, mu, logvar, _ = self._forward(data_batch)
+                loss = loss_fun((recon_batch, mu, logvar), data_batch)
                 loss.backward()
-                train_loss += loss.item()
                 optimizer.step()
 
-            # average training loss
-            train_loss = train_loss / len(train_loader.dataset)
+                batch_size_local = data_batch.size(0)
+                total_train_loss += loss.item() * batch_size_local
+                total_train_samples += batch_size_local
+
+            train_loss = total_train_loss / total_train_samples
             scheduler.step()
 
             # set model to evaluation mode and apply to validation set
             self.eval()
-            val_loss = 0
+            total_val_loss = 0.0
+            total_val_samples = 0
             with torch.no_grad():
-                for _, (data, _) in enumerate(val_loader):
-                    data = data.to(self.device)
-                    recon_batch, mu, logvar, _ = self._forward(data)
-                    loss = loss_fun((recon_batch, mu, logvar), data)
-                    val_loss += loss.item()
+                for data_batch, _ in val_loader:
+                    data_batch = data_batch.to(self.device)
+                    recon_batch, mu, logvar, _ = self._forward(data_batch)
+                    loss = loss_fun((recon_batch, mu, logvar), data_batch)
 
-            # average validation loss
-            val_loss = val_loss / len(val_loader.dataset)
+                    batch_size_local = data_batch.size(0)
+                    total_val_loss += loss.item() * batch_size_local
+                    total_val_samples += batch_size_local
+
+            val_loss = total_val_loss / total_val_samples
 
             # print the current state
             if verbose and (epoch % 10 == 0 or epoch == (nepochs - 1)):
                 lr_loc = optimizer.param_groups[0]["lr"]
-                print(f"Epoch {(epoch + 1):4d}/{nepochs:4d} - lr: {lr_loc:.10f} - train loss: {train_loss:.2f} - val loss: {val_loss:.2f}")
+                print(f"Epoch {(epoch + 1):4d}/{nepochs:4d} - lr: {lr_loc:.10f} - train loss: {train_loss:7.2f} - val loss: {val_loss:7.2f}")
 
             if val_loss < best_loss:
                 # if validation loss is better than the previous best, set the new values for
@@ -431,7 +492,7 @@ class VAESIMCA(nn.Module):
             elif ((val_loss - best_loss) / best_loss > tol):
                 # if difference between current and best validation loss is too large, stop training
                 if verbose:
-                    print(f"The validation loss is getting worse —  stop training.")
+                    print("The validation loss is getting worse —  stop training.")
                 break
             elif best_loss_epochs >= MAX_EPOCHS_UNTIL_BEST_LOSS:
                 if verbose:
@@ -459,21 +520,23 @@ class VAESIMCA(nn.Module):
         self.z_sd = Z.std(axis=0)
 
         U, s, V = np.linalg.svd((Z - self.z_mean) / (self.z_sd + EPSILON), full_matrices=False)
-        self.s = s
-        self.V = np.transpose(V)
-
+        comp_ind = s > EPSILON
+        self.s = s[comp_ind]
+        self.V = np.transpose(V[comp_ind, :])
+        U = U[:, comp_ind]
         h = (U ** 2).sum(axis=1)
         q = (E ** 2).sum(axis=1)
 
-        h0, Nh = getdistparams(h)
-        q0, Nq = getdistparams(q)
+        h0, Nh, hp = get_distparams(h)
+        q0, Nq, qp = get_distparams(q)
+
 
         f = h / h0 * Nh + q / q0 * Nq
-        f0, Nf = getdistparams(f)
+        f0, Nf, fp = get_distparams(f)
 
-        self.hParams = (h0, Nh)
-        self.qParams = (q0, Nq)
-        self.fParams = (f0, Nf)
+        self.hParams = (h0, Nh, hp)
+        self.qParams = (q0, Nq, qp)
+        self.fParams = (f0, Nf, fp)
         self.n = len(q)
 
 
@@ -488,15 +551,14 @@ class VAESIMCA(nn.Module):
 
     def findlr(self, data_path:str, batch_size:int=10, beta:float=1.0,
                num_iter:int=100, start_lr:float=1e-7, end_lr:float=100,
-               loss_norm:bool = True,
-               weight_decay:float=1e-2):
+               weight_decay:float=0):
         """
         Applied FindLR method from "torch_lr_finder" package to find optimal learning rate.
 
         Parameters
         ----------
         data_path : str
-            Path to the directory containing images for the training set.
+            Path to the directory containing images for the training set or to a CSV file with image data as rows.
         batch_size : int, optional
             Batch size for training.
         beta: float, optional
@@ -519,7 +581,7 @@ class VAESIMCA(nn.Module):
 
         data = VAEInputTargetWrapper(self._get_dataset(data_path))
         train_loader = DataLoader(data, batch_size=batch_size)
-        criterion = VAELoss(beta=beta, loss_norm=loss_norm)
+        criterion = VAELoss(beta=beta)
 
         optimizer = optim.Adam(self.parameters(), lr=start_lr, weight_decay=weight_decay)
         lr_finder = LRFinder(self, optimizer, criterion, device=self.device)
@@ -532,21 +594,21 @@ class VAESIMCA(nn.Module):
     def fit(self, data_path:str, nepochs:int=30, batch_size:int=10, lr:float=0.001,
                 val_ratio:float = 0.2, tol:float = 0.05, beta:float = 1.0,
                 scheduler_step_size:int = 10, scheduler_gamma:float = 0.5,
-                loss_norm:bool = True, verbose:bool=True):
+                verbose:bool=True):
         """
         Train VAESIMCA model and set proper model parameters, so it is ready for predictions.
 
         Parameters
         ----------
         data_path : str
-            Path to the directory containing images for the training set.
+            Path to the directory containing images for the training set or to a CSV file with image data as rows.
         nepochs : int, optional
-            The number of epochs to train the VAE pare of model.
+            The number of epochs to train the VAE part of the model.
         batch_size : int, optional
             Batch size for training.
         lr : float, optional
             Initial learning rate for the optimizer.
-        val_ratio : int, optional
+        val_ratio : float, optional
             Ratio of training data to use for validation set.
         tol: float, optional
             Tolerance, if validation loss is more that (tol * 100)% worse than the current best loss training process will stop.
@@ -556,10 +618,9 @@ class VAESIMCA(nn.Module):
             Step size for scheduler to adjust learning rate.
         scheduler_gamma : float, optional
             Gamma parameter for scheduler to adjust learning rate.
-        loss_norm : bool
-            Compute normalized loss or the conventional one (like in initial version).
         verbose : bool, optional
-            If True, print detailed logs during training.
+            If True, prints detailed logs during training.
+
 
         Raises
         ------
@@ -583,22 +644,24 @@ class VAESIMCA(nn.Module):
         # train VAE and simca parts
         self._train_vae(data=data, batch_size=batch_size, nepochs=nepochs, lr=lr, val_ratio=val_ratio,
                         scheduler_step_size=scheduler_step_size, scheduler_gamma=scheduler_gamma,
-                        tol=tol, beta=beta, loss_norm=loss_norm, verbose=verbose)
+                        tol=tol, beta=beta, verbose=verbose)
         self._train_simca(data=data)
 
 
-    def predict(self, data_path:str, alpha:float=0.05, distance:str="f"):
+    def predict(self, data_path:str, alpha:float=0.05, distance:str="f", method:str = "moments"):
         """
         Predicts using the trained model on the given dataset.
 
         Parameters
         ----------
         data_path : str
-            Path to the dataset with images on which to perform predictions.
+            Path to the directory with images or to CSV file with image data on which to perform predictions.
         alpha : float, optional
             Significance level to define expected sensitivity of the model.
-        crit : str, optional
+        distance : str, optional
             Which distance to use for classification (use 'f': full, 'q': residual, 'h': explained).
+        method: str, optional
+            Name of method ("moments" or "quantiles") to use for computing critical limits.
 
         Returns
         -------
@@ -611,6 +674,9 @@ class VAESIMCA(nn.Module):
 
         if distance not in ["f", "q", "h"]:
             raise ValueError(f"Invalid value for distance: '{distance}'. Must be 'f', 'q', or 'h'.")
+
+        if method == "quantiles" and alpha not in [0.10, 0.05, 0.01, 0.001]:
+            raise ValueError("For quantile based predictions alpha should have one of the following values: 0.10, 0.05, 0.01, or 0.001.")
 
         self.eval()
         data = self._get_dataset(data_path)
@@ -626,24 +692,25 @@ class VAESIMCA(nn.Module):
         h = (U ** 2).sum(axis=1)
         q = (E ** 2).sum(axis=1)
 
-        return VAESIMCARes(self.classname, self.img_size, Z, E, T, U, q, h, self.qParams, self.hParams, self.fParams, alpha, labels, class_labels, classes, distance)
+        return VAESIMCARes(self.classname, self.img_size, Z, E, T, U, q, h, self.qParams, self.hParams,
+                           self.fParams, alpha, labels, class_labels, classes, distance, method)
 
 
     @staticmethod
-    def gridsearch(train_path:str, test_path:str, classname:str, encoder_class:nn.Module, decoder_class:nn.Module,
-                   img_size:tuple, transform:callable, nepochs:int=30, scheduler_step_size = 10, scheduler_gamma = 0.5,
-                   loss_norm:bool=True, verbose:bool=True,
-                   lr_seq = [0.001], ld_seq =[4, 8, 16], bs_seq = [10, 20], beta_seq = [0.5, 1.0], niter:int=3,
-                   ) -> pd.DataFrame:
+    def gridsearch(train_path:str, test_path:str, classname:str, encoder_class:nn.Module,
+        decoder_class:nn.Module, img_size:tuple, transform:transforms.Compose, nepochs:int=30,
+        scheduler_step_size = 10, scheduler_gamma = 0.5, verbose:bool=True,
+        lr_seq = [0.001], ld_seq =[4, 8, 16], bs_seq = [10, 20], beta_seq = [0.5, 1.0],
+        niter:int=3) -> pd.DataFrame:
         """
         Conducts a grid search over specified hyperparameters for training the VAESIMCA model.
 
         Parameters
         ----------
         train_path : str
-            The path to the training data.
+            The path to the training data (directory with images or CSV file).
         test_path : str
-            The path to the testing data.
+            The path to the testing data (directory with images or CSV file).
         classname : str
             The target class name (only subset of training data which match this class will be used for training).
         encoder_class : nn.Module
@@ -655,19 +722,13 @@ class VAESIMCA(nn.Module):
         transform : callable
             A function/transform that preprocesses the images.
         nepochs : int, optional
-            The number of epochs to train for each configuration.
+            The maximum number of epochs to train for each configuration.
         scheduler_step_size : int, optional
             Step size for scheduler to adjust learning rate.
         scheduler_gamma : float, optional
             Gamma parameter for scheduler to adjust learning rate.
-        loss_norm : bool
-            Compute normalized loss or the conventional one (like in initial version).
         verbose : bool, optional
             If True, prints detailed logs during the grid search.
-
-        Parameters for optimization
-        ---------------------------
-
         lr_seq : list, optional
             A list of learning rates to try.
         ld_seq : list, optional
@@ -681,30 +742,34 @@ class VAESIMCA(nn.Module):
 
         Returns
         -------
-        DataFrame
-            Contains values of parameters as well as prediction results (number of objects accepted
-            by the model) for each class of training and test sets for each iteration and for each
-            combination of the parameters.
+        DataFrame with following columns
 
-            iter : iteration ID
-            comb : combination ID (identifies unique combination of parameters for optimization)
-            set  : name of the set ("train" or "test")
-            class : name of the class (results are computed separately for each target and alternative classes)
-            beta : beta value used to get this results
-            bs : batch size used to get this results
-            lr : learning rate used to get this results
-            ld : latent space dimension used to get this results
-            n : total number of images in this class
-            in : number of images accepted as members
-            inp : percent of images accepted as members
+            comb :
+                Combination ID (identifies unique combination of parameters for optimization)
+            class :
+                Name of the class (results are computed separately for each target and alternative classes)
+            beta :
+                Beta value used to get this results
+            bs :
+                Batch size used to get this results
+            lr :
+                Learning rate used to get this results
+            ld :
+                Latent space dimension used to get this results
+            sens :
+                Average sensitivity for given combination
+            spec :
+                Average specificity
+            eff :
+                Average efficiency
 
         """
 
-        def show_progress(i, p, n, sens, spec, eff):
+        def show_progress(p, n, sens, spec, eff):
             """ method to print current progress state """
             pct = p / n
             scaled_p = int(50 * pct)  # Scale p to fit within the range [0, 50]
-            symbols_line = f"Iteration {i:2d}: [" + "#" * scaled_p + " " * (50 - scaled_p) + f"] {pct*100:5.1f}% - ({sens:.3f}/{spec:.3f}/{eff:.3f})"
+            symbols_line = "[" + "#" * scaled_p + " " * (50 - scaled_p) + f"] {pct*100:5.1f}% - ({sens:.3f}/{spec:.3f}/{eff:.3f})"
             sys.stdout.write("\r" + symbols_line)
             sys.stdout.flush()
 
@@ -726,20 +791,6 @@ class VAESIMCA(nn.Module):
         params = params.reshape([nargs, ncombs])
 
 
-        # global lists for results
-        g_iter = []
-        g_comb = []
-        g_beta = []
-        g_bs = []
-        g_lr = []
-        g_ld = []
-        g_set = []
-        g_class = []
-        g_n = []
-        g_in = []
-        g_inp = []
-
-        f_iter = []
         f_comb = []
         f_beta = []
         f_bs = []
@@ -754,23 +805,22 @@ class VAESIMCA(nn.Module):
         spec_best = (0, [])
         eff_best = (0, [])
 
-        # global counter for results
-        n = 0
 
         if verbose:
             print(f"\nRun grid search with {ncombs} combinations x {niter} iterations:")
             print("-----------------------------------------------------------------")
 
-        # loop over iterations
-        for i in range(0, niter):
 
-            # loop over parameters:
-            for p in range(0, ncombs):
+        # loop over parameters:
+        for p in range(0, ncombs):
 
-                if verbose:
-                    show_progress(i, p, ncombs, sens_best[0], spec_best[0], eff_best[0]),
+            beta, batch_size, lr, ld = params[:, p]
 
-                beta, batch_size, lr, ld = params[:, p]
+            # loop over iterations
+            sens = 0.
+            spec = 0.
+            eff  = 0.
+            for i in range(0, niter):
 
                 m = VAESIMCA(encoder_class=encoder_class, decoder_class=decoder_class, classname=classname,
                              img_size=img_size, latent_dim=int(ld), transform=transform)
@@ -778,89 +828,59 @@ class VAESIMCA(nn.Module):
                 try:
                     m.fit(data_path=train_path, nepochs=nepochs, beta=beta, lr=lr, batch_size=int(batch_size),
                          scheduler_gamma=scheduler_gamma, scheduler_step_size=scheduler_step_size,
-                         loss_norm=loss_norm, verbose=False)
+                         verbose=False)
 
                 except Exception as error:
                     print("A critical problem occured when training the model with following parameters:")
                     print(f"lr = {lr} ld = {ld} beta = {beta} batch size = {batch_size}")
                     print(error)
 
-                rc, fomc = m.predict(train_path).stat()
-                rt, fomt = m.predict(test_path).stat()
-
-                # save results for the calibration/training set
-                g_iter.append(i)
-                g_comb.append(p)
-                g_beta.append(beta)
-                g_bs.append(batch_size)
-                g_lr.append(lr)
-                g_ld.append(ld)
-                g_set.append("train")
-                g_class.append(classname)
-                g_n.append(rc[classname][0])
-                g_in.append(rc[classname][1])
-                g_inp.append(rc[classname][1] / rc[classname][0])
-                n = n + 1
-
-                # save results for each class from the test set and accumulate results for alternative classes
-                alt_in = 0
-                alt_n = 0
-                for c in test_classes:
-                    g_iter.append(i)
-                    g_comb.append(p)
-                    g_beta.append(beta)
-                    g_bs.append(batch_size)
-                    g_lr.append(lr)
-                    g_ld.append(ld)
-                    g_set.append("test")
-                    g_class.append(c)
-                    g_n.append(rt[c][0])
-                    g_in.append(rt[c][1])
-                    g_inp.append(rt[c][1] / rt[c][0])
-                    n = n + 1
-
+                _, fomt = m.predict(test_path).stat()
 
                 # get foms for test set
-                sens = fomt["sens"]
-                spec = fomt["spec"]
-                eff  = fomt["eff"]
-
-                # adjust best FoM values
-                if spec and spec > spec_best[0]:
-                    spec_best = (spec, [i, lr, ld, beta, batch_size])
-                if sens and sens > sens_best[0]:
-                    sens_best = (sens, [i, lr, ld, beta, batch_size])
-                if eff and eff > eff_best[0]:
-                    eff_best = (eff, [i, lr, ld, beta, batch_size])
-
-                f_iter.append(i)
-                f_comb.append(p)
-                f_beta.append(beta)
-                f_bs.append(batch_size)
-                f_lr.append(lr)
-                f_ld.append(ld)
-                f_sens.append(sens)
-                f_spec.append(spec)
-                f_eff.append(eff)
+                sens = sens + (fomt["sens"] if fomt["sens"] is not None else 0)
+                spec = spec + (fomt["spec"] if fomt["spec"] is not None else 0)
+                eff  = eff  + (fomt["eff"]  if fomt["eff"]  is not None else 0)
 
                 # free memory
                 del m
                 torch.cuda.empty_cache() if torch.cuda.is_available() else None
                 gc.collect()
 
+            sens = sens / niter
+            spec = spec / niter
+            eff  = eff / niter
+
+
+            # adjust best FoM values
+            if spec and spec > spec_best[0]:
+                spec_best = (spec, [lr, ld, beta, batch_size])
+            if sens and sens > sens_best[0]:
+                sens_best = (sens, [lr, ld, beta, batch_size])
+            if eff and eff > eff_best[0]:
+                eff_best = (eff, [lr, ld, beta, batch_size])
+
+            f_comb.append(p)
+            f_beta.append(beta)
+            f_bs.append(batch_size)
+            f_lr.append(lr)
+            f_ld.append(ld)
+            f_sens.append(sens)
+            f_spec.append(spec)
+            f_eff.append(eff)
+
             if verbose:
-                show_progress(i, ncombs, ncombs, sens_best[0], spec_best[0], eff_best[0]),
-                print("")
+                show_progress(p + 1, ncombs, sens_best[0], spec_best[0], eff_best[0])
+
+
 
         if verbose:
-            print("-----------------------------------------------------------------\n")
-            print(f"Best sensitivity:  {sens_best[0]:.3f} - lr={sens_best[1][1]:6f} ld={sens_best[1][2]:4.0f} beta={sens_best[1][3]:.1f} bs={sens_best[1][4]:4.0f}")
-            print(f"Best specificity:  {spec_best[0]:.3f} - lr={spec_best[1][1]:6f} ld={spec_best[1][2]:4.0f} beta={spec_best[1][3]:.1f} bs={spec_best[1][4]:4.0f}")
-            print(f"Best efficiency:   {eff_best[0]:.3f} - lr={eff_best[1][1]:6f} ld={eff_best[1][2]:4.0f} beta={eff_best[1][3]:.1f} bs={eff_best[1][4]:4.0f}")
+            print("\n-----------------------------------------------------------------\n")
+            print(f"Best sensitivity:  {sens_best[0]:.3f} - lr={sens_best[1][0]:6f} ld={sens_best[1][1]:4.0f} beta={sens_best[1][2]:.1f} bs={sens_best[1][3]:4.0f}")
+            print(f"Best specificity:  {spec_best[0]:.3f} - lr={spec_best[1][0]:6f} ld={spec_best[1][1]:4.0f} beta={spec_best[1][2]:.1f} bs={spec_best[1][3]:4.0f}")
+            print(f"Best efficiency:   { eff_best[0]:.3f} - lr={ eff_best[1][0]:6f} ld={ eff_best[1][1]:4.0f} beta={ eff_best[1][2]:.1f} bs={ eff_best[1][3]:4.0f}")
 
-        res_df = pd.DataFrame({"iter": g_iter, "comb": g_comb, "set": g_set, "class": g_class, "beta": g_beta, "bs": g_bs, "lr": g_lr, "ld": g_ld, "n": g_n,  "in": g_in, "inp": g_inp})
-        fom_df = pd.DataFrame({"iter": f_iter, "comb": f_comb, "beta": f_beta, "bs": f_bs, "lr": f_lr, "ld": f_ld, "sens": f_sens, "spec": f_spec, "eff": f_eff})
-        return (res_df, fom_df)
+        return pd.DataFrame({"comb": f_comb, "beta": f_beta, "bs": f_bs, "lr": f_lr, "ld": f_ld, "sens": f_sens, "spec": f_spec, "eff": f_eff})
 
 
 
@@ -897,6 +917,8 @@ class VAESIMCARes:
         List of class labels for the data points.
     classes : list
         List of classes in the dataset the predictions were made for.
+    method: str
+        Name of method ("moments" or "quantiles") to use for computing critical limits.
 
     Attributes
     ----------
@@ -941,17 +963,17 @@ class VAESIMCARes:
         Prints a summary of the statistics.
     plotDistance(plt, distance="q", colors=None, legend_loc=2)
         Plots the specified type of distance for the data points.
-    plotAcceptance(plt, dolog=False, colors=None, markers=None)
+    plotAcceptance(plt, do_log=False, colors=None, markers=None)
         Plots an acceptance graph showing the explained and residual distances and decision boundary.
     """
-    def __init__(self, target_class:str, img_size:tuple, Z:np.ndarray, E:np.ndarray, T:np.ndarray, U:np.ndarray, q:np.array, h:np.array,
+    def __init__(self, target_class:str, img_size:tuple, Z:npt.NDArray, E:npt.NDArray, T:npt.NDArray, U:npt.NDArray, q:npt.NDArray, h:npt.NDArray,
                  qParams:tuple, hParams:tuple, fParams:tuple, alpha:float, labels:list, class_labels:list, classes:list,
-                 crit:str):
+                 crit:str, method:str):
 
         n = len(q)
-        h0, Nh = hParams
-        q0, Nq = qParams
-        f0, Nf = fParams
+        h0, Nh, hp = hParams
+        q0, Nq, qp = qParams
+        f0, Nf, fp = fParams
 
         self.target_class = target_class
         self.img_size = img_size
@@ -970,25 +992,28 @@ class VAESIMCARes:
         self.labels = labels
         self.classes = classes
         self.class_labels = class_labels
+        self.method = method
 
         if crit == "f":
-            self.regular = self.f < getlimits(f0, Nf, alpha=alpha)
+            self.regular = self.f < get_limits(f0, Nf, alpha=alpha, up=fp, method = method)
         elif crit == "q":
-            self.regular = self.q < getlimits(q0, Nq, alpha=alpha)
+            self.regular = self.q < get_limits(q0, Nq, alpha=alpha, up=qp, method = method)
         elif crit == "h":
-            self.regular = self.h < getlimits(h0, Nh, alpha=alpha)
+            self.regular = self.h < get_limits(h0, Nh, alpha=alpha, up=hp, method = method)
         else:
             raise ValueError("Wrong value for parameter 'crit' (must be 'f', 'q', or 'h').")
 
 
-    def stat(self):
+    def stat(self) -> tuple[dict, dict]:
         """
         Computes statistics for the number of data points falling within expected ranges per class.
 
         Returns
         -------
-        dict
-            A dictionary with classes as keys and lists of counts: total, within range, and out of range.
+        tule
+            A tuple with two dictionaries. First contains classes as keys and lists of counts: total,
+            within range, and out of range. Second contains number of true positives, false negatives,
+            true negatives and false positives.
         """
         stat = {}
 
@@ -1034,9 +1059,12 @@ class VAESIMCARes:
             print(f"{c:<{slen}s} {total:{dlen}d} {in_range:{dlen}d} {in_pct:6.1f} {out_of_range:{dlen}d} {out_pct:7.1f}")
 
         print("")
-        if foms["sens"]: print(f"sensitivity: {foms['sens']:.3f}")
-        if foms["spec"]: print(f"specificity: {foms['spec']:.3f}")
-        if foms["eff"]:  print(f"efficiency: {foms['eff']:.3f}")
+        if foms["sens"]:
+            print(f"sensitivity: {foms['sens']:.3f}")
+        if foms["spec"]:
+            print(f"specificity: {foms['spec']:.3f}")
+        if foms["eff"]:
+            print(f"efficiency: {foms['eff']:.3f}")
 
 
     def as_df(self):
@@ -1051,22 +1079,22 @@ class VAESIMCARes:
         })
 
 
-    def plotDistance(self, plt:matplotlib.pyplot, distance:str="q", colors:list=None, legend_loc:int=2,
-                    show_boundaries:bool = False, show_labels:bool = False):
+    def plotDistance(self, ax:Axes, distance:str="q", colors:dict|None=None, legend_loc:int=2,
+                    show_crit:bool = False, show_labels:bool = False):
         """
         Plots the specified type of distance for the data points.
 
         Parameters
         ----------
-        plt : matplotlib.pyplot
-            Matplotlib plot module.
+        ax : matplotlib.axes.Axes
+            Matplotlib axes instance.
         distance : str, optional
             The type of distance to plot ('q', 'h', or 'f').
-        colors : list, optional
-            List of colors for each class.
+        colors : dict, optional
+            Dictionary with colors (one for each class).
         legend_loc : int, optional
             Location of the legend in the plot.
-        show_boundaries : bool, optional
+        show_crit : bool, optional
             Logical, show or not decision and outlier boundaries
         show_labels : bool, optional
             Logical, show or not object labels on top of each bar
@@ -1080,55 +1108,66 @@ class VAESIMCARes:
 
         if distance not in ('q', 'h', 'f'):
             raise ValueError("Invalid distance type specified. Choose 'q', 'h', or 'f'.")
+
+        nclasses = len(self.classes)
         if colors is None:
-            colors = COLORS
-        if len(colors) < len(self.classes):
-            raise ValueError(f"Colors for each of the {len(self.classes)} must be provided.")
+            colors = get_group_colors(self.classes)
+        elif len(colors) < nclasses:
+            raise ValueError(f"Colors for each of the {nclasses} must be provided.")
+
 
         params = {'q': self.qParams, 'h': self.hParams, 'f': self.fParams}
         distances = {'q': self.q / self.qParams[0], 'h': self.h / self.hParams[0], 'f': self.f / self.fParams[0]}[distance]
         title_map = {'q': "Residual", 'h': "Explained", 'f': "Full"}
 
-        # map each class to a color
-        class_to_color = {
-            cls: colors[i] for i, cls in enumerate(self.classes)
-        }
 
         x = np.arange(len(distances))
-        colors = [class_to_color[cls] for cls in self.class_labels]
-        plt.bar(x, distances, color = colors)
+        y = distances
+        lbs = self.labels
+        dy = np.max(y) * 0.05
 
-        if show_labels:
-            plotlabels(plt, x, distances, self.labels)
+        if nclasses > 0 and colors is not None:
+            g = self.class_labels
+            gu = np.unique(g)
+            for c in gu:
+                class_points = [(x[j], y[j], lbs[j]) for j, gl in enumerate(g) if gl == c]
+                if not class_points:
+                    continue
+                cx, cy, cl = zip(*class_points)
+                cx = np.asarray(cx, dtype=float)
+                cy = np.asarray(cy, dtype=float)
+                cl = np.asarray(cl)
+                ax.bar(cx, cy, color = colors[c], label = c)
+                if show_labels:
+                    plot_labels(ax, cx, cy, cl, dy)
+        else:
+            ax.bar(x, y, color = MAIN_COLOR)
+            if show_labels:
+                plot_labels(ax, x, y, lbs, dy)
 
-        if show_boundaries:
-            u0, Nu = params[distance]
-            lim = getlimits(u0, Nu, alpha = self.alpha) / u0
-            xr = plt.xlim()
-            plt.plot(xr, [lim, lim], 'k--', linewidth=0.5)
+        if show_crit:
+            u0, Nu, up = params[distance]
+            lim = get_limits(u0, Nu, alpha = self.alpha, up = up, method=self.method) / u0
+            xr = ax.get_xlim()
+            ax.plot(xr, [lim, lim], 'k--', linewidth=0.5)
 
 
-        legend_handles = [
-            mpatches.Patch(color=color, label=cls)
-            for cls, color in class_to_color.items()
-        ]
-
-        plt.legend(handles=legend_handles, loc = legend_loc)
-        plt.title(f"{title_map[distance]} distance")
-        plt.ylabel(f"{distance}-distance")
-        plt.xlabel("Objects")
+        ax.legend(loc = legend_loc)
+        ax.set_title(f"{title_map[distance]} distance")
+        ax.set_ylabel(f"{distance}-distance")
+        ax.set_xlabel("Objects")
 
 
-    def plotAcceptance(self, plt:matplotlib.pyplot, dolog:bool=False, colors:list=None, markers:list=None,
+    def plotAcceptance(self, ax:Axes, do_log:bool=False, colors:dict|None=None, markers:list|None=None,
                        legend_loc:str = "best", show_labels:bool = False):
         """
         Plots an acceptance graph showing scaled explained and residual distances and the decision boundary.
 
         Parameters
         ----------
-        plt : matplotlib.pyplot
-            Matplotlib plot module.
-        dolog : bool, optional
+        ax : matplotlib.axes.Axes
+            Matplotlib axes instance.
+        do_log : bool, optional
             Whether to plot the original distances or log-transformed (log(1 + u)).
         colors : list, optional
             List of colors for each class.
@@ -1148,53 +1187,56 @@ class VAESIMCARes:
 
         if markers is None:
             markers = MARKERS
-        if colors is None:
-            colors = COLORS
 
-        if len(colors) < len(self.classes):
-            raise ValueError(f"Colors for each of the {len(self.classes)} must be provided.")
+        nclasses = len(self.classes)
+        if colors is None:
+            colors = get_group_colors(self.classes)
+        elif len(colors) < nclasses:
+            raise ValueError(f"Colors for each of the {nclasses} must be provided.")
+
         if len(markers) < len(self.classes):
             raise ValueError(f"Markers for each of the {len(self.classes)} must be provided.")
 
-        h0, Nh = self.hParams
-        q0, Nq = self.qParams
-        f0, Nf = self.fParams
+        h0, Nh, _ = self.hParams
+        q0, Nq, _ = self.qParams
+        f0, Nf, fp = self.fParams
 
-        h_scaled = np.log1p(self.h / h0) if dolog else self.h / h0
-        q_scaled = np.log1p(self.q / q0) if dolog else self.q / q0
+        h_scaled = np.log1p(self.h / h0) if do_log else self.h / h0
+        q_scaled = np.log1p(self.q / q0) if do_log else self.q / q0
+        dy = np.max(q_scaled) * 0.05
 
         for i, c in enumerate(self.classes):
             class_points = [(h_scaled[j], q_scaled[j], self.labels[j]) for j, label in enumerate(self.class_labels) if label == c]
             cx, cy, cl = zip(*class_points)
-            plt.scatter(cx, cy, label=c, marker=markers[i], edgecolors=colors[i], facecolors='none')
+            ax.scatter(cx, cy, label=c, marker=markers[i], edgecolors=colors[c], facecolors="none")
             if show_labels:
-                plotlabels(plt, cx, cy, cl)
+                plot_labels(ax, np.array(cx), np.array(cy), np.array(cl), dy)
 
 
         # show decision and outliers boundaries
-        fCritE = getlimits(f0, Nf, alpha = self.alpha)
+        fCritE = get_limits(f0, Nf, alpha = self.alpha, up = fp, method=self.method)
         xqeMax = fCritE / Nh
         xqe = np.linspace(0, xqeMax, 200)
         yqe = (fCritE - xqe * Nh) / Nq
 
-        if dolog:
+        if do_log:
             xqe = np.log1p(xqe)
             yqe = np.log1p(yqe)
 
-        plt.plot(xqe, yqe, 'k--', linewidth=0.5)
-        plt.legend(loc = legend_loc)
-        plt.grid(color = "#e0e0e0", linestyle = ":")
-        plt.title("Acceptance Plot")
+        ax.plot(xqe, yqe, 'k--', linewidth=0.5)
+        ax.legend(loc = legend_loc)
+        ax.grid(color = "#e0e0e0", linestyle = ":")
+        ax.set_title("Acceptance Plot")
 
-        if dolog:
-            plt.xlabel("Explained distance, log(1 + h/h0)")
-            plt.ylabel("Residual distance, log(1 + q/q0)")
+        if do_log:
+            ax.set_xlabel("Explained distance, log(1 + h/h0)")
+            ax.set_ylabel("Residual distance, log(1 + q/q0)")
         else:
-            plt.xlabel("Explained distance, h/h0")
-            plt.ylabel("Residual distance, q/q0")
+            ax.set_xlabel("Explained distance, h/h0")
+            ax.set_ylabel("Residual distance, q/q0")
 
 
-    def plotError(self, plt:matplotlib.pyplot, ind:int = None, classname:str = None, object_label:str = None):
+    def plotError(self, ax:Axes, ind:int|None = None, classname:str|None = None, object_label:str|None = None) -> AxesImage:
         """
         Show image with reconstruction error for object with given label and class name.
 
@@ -1217,25 +1259,24 @@ class VAESIMCARes:
         if ind is None and (classname is None or object_label is None):
             raise ValueError("You need to specify either object index or class and object labels.")
 
-        if classname and not classname in self.classes:
+        if classname and classname not in self.classes:
             raise ValueError("Can not find class with name '{classname}' in this result object.")
 
-        if not ind is None:
+        if ind is not None:
             if ind < 0 or ind > self.n - 1:
                 raise ValueError("Wrong value for object index.")
             classname = self.class_labels[ind]
             object_label = self.labels[ind]
-        else:
-            ind = [i for i in range(self.n) if self.class_labels[i] == classname and self.labels[i] == object_label]
-            if len(ind) < 1:
+        elif object_label is not None and classname is not None:
+            ind_seq = [i for i in range(self.n) if self.class_labels[i] == classname and self.labels[i] == object_label]
+            if len(ind_seq) < 1:
                 raise ValueError("Can not find object with label '{object_label}' among elements of class '{classname}'")
-            ind = ind[0]
+            ind = ind_seq[0]
 
         mn = np.min(self.E)
         mx = np.max(self.E)
         e = self.E[ind, :].reshape(self.img_size[0], self.img_size[1])
-        plt.imshow(e)
-        plt.colorbar()
-        plt.title(f"{classname}:{object_label}")
-        plt.clim([mn, mx])
+        im = ax.imshow(e, vmin = mn, vmax = mx)
+        ax.set_title(f"{classname}:{object_label}")
+        return im
 
